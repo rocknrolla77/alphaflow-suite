@@ -42,6 +42,12 @@ export interface Proposal {
     weight: number;
     sourceTag: NansenTag;
     confidence: number;
+    /** Уникальный nonce для защиты от replay attack */
+    nonce: number;
+    /** Unix timestamp крайнего срока исполнения */
+    deadline: number;
+    /** UUID для идентификации в Redis/TG pipeline */
+    proposalId: string;
 }
 
 export interface SignedProposal {
