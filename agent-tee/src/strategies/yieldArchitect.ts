@@ -1,259 +1,300 @@
-// Файл: agent-tee/src/strategies/yieldArchitect.ts
-// Yield Architect — Smart Money Tracker & Strategy Engine
-// Работает исключительно внутри Phala TEE-анклава
+// ═══════════════════════════════════════════════════════════════════════════════
+// AlphaFlow Suite — agent-tee/src/strategies/yieldArchitect.ts
+// Стратегический модуль TEE-агента: расчёт объёмов + EIP-712 подпись
+// ═══════════════════════════════════════════════════════════════════════════════
 
-import { keccak256, toBytes, encodePacked, type Hex } from "viem";
-import { privateKeyToAccount, signTypedData } from "viem/accounts";
+import { ethers, type Wallet, type HDNodeWallet, type TypedDataDomain, type TypedDataField } from "ethers";
 import type {
     SmartMoneySignal,
     UserRiskProfile,
     Proposal,
     SignedProposal,
-    NansenTag,
-} from "../types";
-import { NansenMCPClient } from "../services/nansenClient";
+} from "../types/index.js";
 
-// EIP-712 Domain для Proof-of-Reasoning
-const EIP712_DOMAIN = {
-    name: "AlphaFlow_TEE_Enclave",
-    version: "1",
-    chainId: 5000, // Mantle Network
-} as const;
-
-// EIP-712 Types
-const PROPOSAL_TYPES = {
+/**
+ * EIP-712 Type Definitions для Proposal.
+ * Используется ethers.Wallet.signTypedData для формирования подписи.
+ */
+const PROPOSAL_TYPES: Record<string, TypedDataField[]> = {
     Proposal: [
         { name: "asset", type: "address" },
         { name: "action", type: "string" },
         { name: "recommendedAmount", type: "uint256" },
-        { name: "timestamp", type: "uint256" },
+        { name: "nonce", type: "uint256" },
+        { name: "deadline", type: "uint256" },
         { name: "reasoningHash", type: "bytes32" },
-        { name: "weight", type: "uint256" },
-        { name: "confidence", type: "uint256" },
     ],
-} as const;
-
-/**
- * Конфигурация весов для разных тегов Smart Money.
- * Fund и VC имеют больший вес — их сделки более информативны.
- */
-const TAG_CONFIDENCE_MAP: Record<NansenTag, number> = {
-    Fund: 0.9,
-    VC: 0.85,
-    "90D Smart Trader": 0.7,
-    Whale: 0.5,
-    "Flash Trader": 0.3,
 };
 
 /**
- * Yield Architect — TEE Smart Money Strategy Engine
+ * YieldArchitect — стратегический движок TEE-агента.
  *
- * Алгоритм:
- * 1. Получает сигналы от Nansen MCP (Smart Money transactions)
- * 2. Фильтрует по значимости (minSignalUsd, тег кита)
- * 3. Рассчитывает весовой коэффициент W = S_smart / V_smart
- * 4. Нормализует под пользователя: S_user = V_user × W × K_risk
- * 5. Применяет safety caps (maxPositionPct)
- * 6. Агрегирует multiple signals для одного актива (boosted confidence)
- * 7. Подписывает Proposal через EIP-712 (Proof-of-Reasoning)
+ * Обязанности:
+ * 1. Расчёт объёма по формуле Smart Money Weight
+ * 2. Валидация входных данных (bounds checking)
+ * 3. Формирование reasoningHash (доказательство вычислимости)
+ * 4. EIP-712 подпись Proposal ключом анклава
  *
- * Инвариант безопасности:
- * - recommendedAmount НИКОГДА не превышает balance × maxPositionPct
- * - При K_risk = 0 → recommendedAmount = 0 (полная пауза)
- * - Подпись верифицируема on-chain через ecrecover
+ * ИНВАРИАНТ: приватный ключ (this.signer) НИКОГДА не покидает этот класс.
+ * Единственный экспортируемый артефакт — SignedProposal (данные + подпись).
  */
 export class YieldArchitect {
-    private nansenClient: NansenMCPClient;
-    private teePrivateKey: `0x${string}`;
-    private teeSignerAddress: `0x${string}`;
-
-    constructor(nansenClient: NansenMCPClient, teePrivateKey: `0x${string}`) {
-        this.nansenClient = nansenClient;
-        this.teePrivateKey = teePrivateKey;
-        const account = privateKeyToAccount(teePrivateKey);
-        this.teeSignerAddress = account.address;
-    }
+    private readonly signer: Wallet | HDNodeWallet;
+    private readonly domain: TypedDataDomain;
+    private nonce: number;
 
     /**
-     * Генерирует подписанное предложение на основе одного сигнала Smart Money.
+     * @param signer — Wallet (in-memory ECDSA key, создан в main.ts)
+     * @param chainId — ID цепи (5000 для Mantle mainnet)
+     * @param initialNonce — начальное значение счётчика (из Redis при restart)
      */
-    async generateProposal(
-        signal: SmartMoneySignal,
-        profile: UserRiskProfile
-    ): Promise<SignedProposal> {
-        // ─── Validation ──────────────────────────────────────────────
-        if (signal.vSmart <= 0) {
-            throw new Error("Invalid Smart Money volume: V_smart must be > 0");
-        }
-        if (signal.sSmart < profile.minSignalUsd) {
-            throw new Error(
-                `Signal too small: ${signal.sSmart} < minSignalUsd ${profile.minSignalUsd}`
-            );
-        }
-        if (profile.riskFactor < 0 || profile.riskFactor > 1) {
-            throw new Error("riskFactor must be in [0, 1]");
-        }
+    constructor(signer: Wallet | HDNodeWallet, chainId: number, initialNonce: number = 0) {
+        this.signer = signer;
+        this.nonce = initialNonce;
 
-        // ─── Step 1: Weight Calculation ──────────────────────────────
-        const W = signal.sSmart / signal.vSmart;
-
-        // ─── Step 2: User Amount (normalized) ────────────────────────
-        let sUser = profile.balance * W * profile.riskFactor;
-
-        // ─── Step 3: Safety Caps ─────────────────────────────────────
-        const maxPosition = profile.balance * profile.maxPositionPct;
-        sUser = Math.min(sUser, maxPosition);
-
-        // Дополнительный cap: не более того, что вложил кит (в пропорции)
-        sUser = Math.max(sUser, 0); // Никогда отрицательное
-
-        // ─── Step 4: Confidence ──────────────────────────────────────
-        const confidence = TAG_CONFIDENCE_MAP[signal.tag] || 0.3;
-
-        // ─── Step 5: Reasoning Hash ─────────────────────────────────
-        const reasoningHash = this.computeReasoningHash(signal, profile, W, sUser);
-
-        // ─── Step 6: Build Proposal ──────────────────────────────────
-        const proposal: Proposal = {
-            asset: signal.assetAddress,
-            action: signal.action,
-            recommendedAmount: Math.floor(sUser * 100) / 100, // 2 decimal places
-            timestamp: Math.floor(Date.now() / 1000),
-            reasoningHash,
-            weight: Math.floor(W * 1e6) / 1e6, // 6 decimal precision
-            sourceTag: signal.tag,
-            confidence,
-        };
-
-        // ─── Step 7: EIP-712 Signature (Proof-of-Reasoning) ─────────
-        const signature = await this.signProposal(proposal);
-
-        return {
-            proposal,
-            proofOfReasoning: signature,
-            teeSignerAddress: this.teeSignerAddress,
+        this.domain = {
+            name: "AlphaFlow_TEE",
+            version: "1",
+            chainId: chainId,
         };
     }
 
     /**
-     * Агрегирует несколько сигналов для одного актива.
-     * Multiple Smart Money покупают = усиленный сигнал.
+     * Публичный адрес TEE-signer.
+     * Единственная информация о ключе, доступная извне.
      */
-    async generateAggregatedProposal(
-        signals: SmartMoneySignal[],
-        profile: UserRiskProfile
-    ): Promise<SignedProposal> {
-        if (signals.length === 0) throw new Error("No signals to aggregate");
-
-        // Все сигналы должны быть для одного актива и одного действия
-        const asset = signals[0].assetAddress;
-        const action = signals[0].action;
-        if (!signals.every((s) => s.assetAddress === asset && s.action === action)) {
-            throw new Error("Cannot aggregate signals for different assets/actions");
-        }
-
-        // ─── Aggregated Weight ───────────────────────────────────────
-        // W_agg = Σ(S_smart_i / V_smart_i) / N (среднее W)
-        const weights = signals.map((s) => s.sSmart / s.vSmart);
-        const avgWeight = weights.reduce((sum, w) => sum + w, 0) / weights.length;
-
-        // ─── Boosted Confidence ──────────────────────────────────────
-        // Больше китов = выше уверенность (capped at 0.95)
-        const baseConfidence = signals.reduce(
-            (sum, s) => sum + (TAG_CONFIDENCE_MAP[s.tag] || 0.3),
-            0
-        ) / signals.length;
-        const boostFactor = Math.min(1 + Math.log2(signals.length) * 0.1, 1.5);
-        const confidence = Math.min(baseConfidence * boostFactor, 0.95);
-
-        // ─── Calculate Amount ────────────────────────────────────────
-        let sUser = profile.balance * avgWeight * profile.riskFactor * confidence;
-        const maxPosition = profile.balance * profile.maxPositionPct;
-        sUser = Math.min(sUser, maxPosition);
-        sUser = Math.max(sUser, 0);
-
-        // ─── Build Aggregated Proposal ───────────────────────────────
-        const reasoningHash = keccak256(
-            encodePacked(
-                ["address", "uint256", "uint256", "uint256"],
-                [
-                    asset,
-                    BigInt(Math.floor(avgWeight * 1e18)),
-                    BigInt(signals.length),
-                    BigInt(Math.floor(Date.now() / 1000)),
-                ]
-            )
-        );
-
-        const proposal: Proposal = {
-            asset,
-            action,
-            recommendedAmount: Math.floor(sUser * 100) / 100,
-            timestamp: Math.floor(Date.now() / 1000),
-            reasoningHash: reasoningHash as `0x${string}`,
-            weight: Math.floor(avgWeight * 1e6) / 1e6,
-            sourceTag: signals[0].tag, // Primary tag
-            confidence: Math.floor(confidence * 1000) / 1000,
-        };
-
-        const signature = await this.signProposal(proposal);
-
-        return {
-            proposal,
-            proofOfReasoning: signature,
-            teeSignerAddress: this.teeSignerAddress,
-        };
+    public get signerAddress(): string {
+        return this.signer.address;
     }
 
-    // ─── Private Helpers ─────────────────────────────────────────────
+    /**
+     * Текущий nonce (для мониторинга).
+     */
+    public get currentNonce(): number {
+        return this.nonce;
+    }
 
     /**
-     * Вычисляет reasoning hash — криптографическое доказательство
-     * того, на основе каких данных принято решение.
+     * Расчёт рекомендуемого объёма по формуле Smart Money Weight.
+     *
+     * Формула:
+     *   W = S_smart / V_smart           (conviction weight)
+     *   S_user = V_user × W × K_risk    (user-scaled volume)
+     *
+     * Где:
+     *   S_smart = объём сделки Smart Money (tradeVolume)
+     *   V_smart = общий портфель Smart Money (totalPortfolioValue)
+     *   V_user  = доступный баланс пользователя (availableBalance)
+     *   K_risk  = коэффициент консерватизма [0.1, 1.0]
+     *
+     * @param signal — сигнал от Nansen MCP
+     * @param profile — риск-профиль пользователя
+     * @returns рекомендуемый объём в wei (bigint)
+     * @throws Error если входные данные невалидны
      */
-    private computeReasoningHash(
+    public calculateVolume(signal: SmartMoneySignal, profile: UserRiskProfile): bigint {
+        // ─── Валидация входных данных ─────────────────────────────────────
+        if (signal.totalPortfolioValue === 0n) {
+            throw new Error("INVARIANT: totalPortfolioValue cannot be zero (division by zero)");
+        }
+        if (signal.tradeVolume === 0n) {
+            throw new Error("INVARIANT: tradeVolume cannot be zero (no signal)");
+        }
+        if (signal.tradeVolume > signal.totalPortfolioValue) {
+            throw new Error("INVARIANT: tradeVolume > totalPortfolioValue (invalid signal)");
+        }
+        if (profile.availableBalance === 0n) {
+            throw new Error("INVARIANT: availableBalance is zero (nothing to trade)");
+        }
+        if (profile.riskCoefficient < 0.1 || profile.riskCoefficient > 1.0) {
+            throw new Error("INVARIANT: riskCoefficient must be in [0.1, 1.0]");
+        }
+
+        // ─── Математика ──────────────────────────────────────────────────
+        // W = S_smart / V_smart
+        // Используем scaled arithmetic для сохранения precision:
+        // W_scaled = (S_smart * PRECISION) / V_smart
+        const PRECISION = 10n ** 18n;
+
+        const wScaled: bigint = (signal.tradeVolume * PRECISION) / signal.totalPortfolioValue;
+
+        // S_user = V_user × W × K_risk
+        // K_risk нормализуем: 0.5 → 5000/10000
+        const kRiskScaled: bigint = BigInt(Math.round(profile.riskCoefficient * 10000));
+        const K_RISK_DENOMINATOR = 10000n;
+
+        const recommendedAmount: bigint =
+            (profile.availableBalance * wScaled * kRiskScaled) /
+            (PRECISION * K_RISK_DENOMINATOR);
+
+        // ─── Верхняя граница: не более 100% баланса ──────────────────────
+        if (recommendedAmount > profile.availableBalance) {
+            return profile.availableBalance;
+        }
+
+        // ─── Нижняя граница: отбрасываем dust (< 1000 wei) ──────────────
+        if (recommendedAmount < 1000n) {
+            throw new Error("SKIP: calculated amount below dust threshold (< 1000 wei)");
+        }
+
+        return recommendedAmount;
+    }
+
+    /**
+     * Генерация reasoningHash — криптографическое доказательство того,
+     * что рекомендация вычислена на основе конкретных входных данных.
+     *
+     * hash = keccak256(abi.encode(
+     *   signal.walletAddress,
+     *   signal.asset,
+     *   signal.tradeVolume,
+     *   signal.totalPortfolioValue,
+     *   signal.detectedAt,
+     *   profile.accountAddress,
+     *   profile.availableBalance,
+     *   profile.riskCoefficient_scaled,
+     *   recommendedAmount
+     * ))
+     *
+     * Любой аудитор может повторить вычисление и сверить хэш.
+     */
+    public computeReasoningHash(
         signal: SmartMoneySignal,
         profile: UserRiskProfile,
-        weight: number,
-        sUser: number
-    ): `0x${string}` {
-        return keccak256(
-            encodePacked(
-                ["address", "address", "uint256", "uint256", "uint256", "uint256"],
-                [
-                    signal.assetAddress,
-                    signal.walletAddress,
-                    BigInt(Math.floor(signal.sSmart * 1e6)),
-                    BigInt(Math.floor(signal.vSmart * 1e6)),
-                    BigInt(Math.floor(weight * 1e18)),
-                    BigInt(Math.floor(sUser * 1e6)),
-                ]
-            )
-        ) as `0x${string}`;
+        recommendedAmount: bigint
+    ): string {
+        const encoded = ethers.AbiCoder.defaultAbiCoder().encode(
+            [
+                "address",  // signal.walletAddress
+                "address",  // signal.asset
+                "uint256",  // signal.tradeVolume
+                "uint256",  // signal.totalPortfolioValue
+                "uint256",  // signal.detectedAt
+                "address",  // profile.accountAddress
+                "uint256",  // profile.availableBalance
+                "uint256",  // profile.riskCoefficient (scaled to 10000)
+                "uint256",  // recommendedAmount
+            ],
+            [
+                signal.walletAddress,
+                signal.asset,
+                signal.tradeVolume,
+                signal.totalPortfolioValue,
+                signal.detectedAt,
+                profile.accountAddress,
+                profile.availableBalance,
+                BigInt(Math.round(profile.riskCoefficient * 10000)),
+                recommendedAmount,
+            ]
+        );
+
+        return ethers.keccak256(encoded);
     }
 
     /**
-     * Подписывает Proposal через EIP-712.
-     * Приватный ключ TEE никогда не покидает анклав.
+     * Генерация и подпись Proposal.
+     *
+     * Полный pipeline:
+     * 1. calculateVolume → рекомендуемый объём
+     * 2. computeReasoningHash → доказательство вычислимости
+     * 3. EIP-712 signTypedData → подпись ключом анклава
+     * 4. Инкремент nonce (monotonic, replay protection)
+     *
+     * @param signal — сигнал Smart Money от Nansen MCP
+     * @param profile — риск-профиль пользователя
+     * @param ttlSeconds — время жизни proposal (default 300 = 5 мин)
+     * @returns SignedProposal готовый к публикации в Redis
      */
-    private async signProposal(proposal: Proposal): Promise<`0x${string}`> {
-        const account = privateKeyToAccount(this.teePrivateKey);
+    public async generateProposal(
+        signal: SmartMoneySignal,
+        profile: UserRiskProfile,
+        ttlSeconds: number = 300
+    ): Promise<SignedProposal> {
+        // ─── Step 1: Расчёт объёма ───────────────────────────────────────
+        const recommendedAmount = this.calculateVolume(signal, profile);
 
-        const signature = await account.signTypedData({
-            domain: EIP712_DOMAIN,
-            types: PROPOSAL_TYPES,
-            primaryType: "Proposal",
-            message: {
+        // ─── Step 2: Reasoning Hash ─────────────────────────────────────
+        const reasoningHash = this.computeReasoningHash(signal, profile, recommendedAmount);
+
+        // ─── Step 3: Формирование Proposal ───────────────────────────────
+        const currentNonce = this.nonce;
+        const deadline = Math.floor(Date.now() / 1000) + ttlSeconds;
+
+        const proposal: Proposal = {
+            asset: signal.asset,
+            action: signal.action,
+            recommendedAmount: recommendedAmount,
+            nonce: currentNonce,
+            deadline: deadline,
+            reasoningHash: reasoningHash,
+        };
+
+        // ─── Step 4: EIP-712 подпись ─────────────────────────────────────
+        // signTypedData использует приватный ключ ТОЛЬКО в памяти.
+        // Ключ никогда не сериализуется и не передаётся за пределы процесса.
+        const signature = await this.signer.signTypedData(
+            this.domain,
+            PROPOSAL_TYPES,
+            {
                 asset: proposal.asset,
                 action: proposal.action,
-                recommendedAmount: BigInt(Math.floor(proposal.recommendedAmount * 1e6)),
-                timestamp: BigInt(proposal.timestamp),
+                recommendedAmount: proposal.recommendedAmount,
+                nonce: proposal.nonce,
+                deadline: proposal.deadline,
                 reasoningHash: proposal.reasoningHash,
-                weight: BigInt(Math.floor(proposal.weight * 1e6)),
-                confidence: BigInt(Math.floor(proposal.confidence * 1000)),
-            },
-        });
+            }
+        );
 
-        return signature;
+        // ─── Step 5: Инкремент nonce (монотонный, необратимый) ───────────
+        this.nonce++;
+
+        // ─── Step 6: Сборка SignedProposal ───────────────────────────────
+        const signedProposal: SignedProposal = {
+            ...proposal,
+            signature: signature,
+            signerAddress: this.signer.address,
+            generatedAt: Math.floor(Date.now() / 1000),
+        };
+
+        return signedProposal;
+    }
+
+    /**
+     * Верификация подписи Proposal (статический метод).
+     * Используется BFF и аудиторами для проверки без доступа к ключу.
+     *
+     * @param proposal — Proposal для верификации
+     * @param signature — EIP-712 подпись (hex)
+     * @param expectedSigner — ожидаемый адрес подписанта
+     * @param chainId — ID цепи
+     * @returns true если подпись валидна и принадлежит expectedSigner
+     */
+    public static verifyProposal(
+        proposal: Proposal,
+        signature: string,
+        expectedSigner: string,
+        chainId: number = 5000
+    ): boolean {
+        const domain: TypedDataDomain = {
+            name: "AlphaFlow_TEE",
+            version: "1",
+            chainId: chainId,
+        };
+
+        const recoveredAddress = ethers.verifyTypedData(
+            domain,
+            PROPOSAL_TYPES,
+            {
+                asset: proposal.asset,
+                action: proposal.action,
+                recommendedAmount: proposal.recommendedAmount,
+                nonce: proposal.nonce,
+                deadline: proposal.deadline,
+                reasoningHash: proposal.reasoningHash,
+            },
+            signature
+        );
+
+        return recoveredAddress.toLowerCase() === expectedSigner.toLowerCase();
     }
 }
