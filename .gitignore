@@ -1,0 +1,23 @@
+# Compiler output
+contracts/out/
+contracts/cache/
+
+# Env files
+.env
+*.env.local
+
+# Agent secrets
+agent-tee/config/*.key
+agent-tee/config/.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (frontend, future)
+node_modules/
+dist/

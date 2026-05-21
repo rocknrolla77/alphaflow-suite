@@ -1,0 +1,29 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+evm_version = "cancun"
+solc_version = "0.8.24"
+optimizer = true
+optimizer_runs = 1000
+via_ir = false
+
+remappings = [
+    "@openzeppelin/=lib/openzeppelin-contracts/",
+    "forge-std/=lib/forge-std/src/",
+]
+
+[profile.default.fuzz]
+runs = 1000
+max_test_rejects = 65536
+
+[profile.default.invariant]
+runs = 256
+depth = 50
+
+[rpc_endpoints]
+mantle_mainnet = "${MANTLE_RPC_URL}"
+mantle_fork = "https://rpc.mantle.xyz"
+
+[etherscan]
+mantle = { key = "${MANTLESCAN_API_KEY}", url = "https://api.mantlescan.xyz/api" }
