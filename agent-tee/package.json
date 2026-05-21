@@ -1,0 +1,24 @@
+{
+  "name": "alphaflow-agent-tee",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TEE Agent for AlphaFlow Suite — Smart Money tracking, strategy, execution",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@zerodev/sdk": "*",
+    "@zerodev/session-key": "*",
+    "@zerodev/ecdsa-validator": "*",
+    "viem": "^2.50.0",
+    "permissionless": "^0.3.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "@types/node": "^20.0.0"
+  }
+}

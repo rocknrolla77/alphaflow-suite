@@ -2,11 +2,13 @@
 // Модуль исполнения арбитража TEE-агентом через Session Key
 // Поддержка 2D Nonces (ERC-4337 v0.7) для параллельного пакетирования
 
-import { createPublicClient, http, encodeFunctionData, parseAbi } from "viem";
+import { createPublicClient, http, encodeFunctionData, parseAbi, keccak256, encodePacked } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { createKernelAccountClient, createKernelAccount } from "@zerodev/sdk";
 import { signerToSessionKeyValidator } from "@zerodev/session-key";
 import { ENTRYPOINT_ADDRESS_V07 } from "permissionless";
+import { PaymasterRateLimiter } from "./services/rateLimiter";
+import type { RateLimitConfig } from "./types";
 
 // ABI для кодирования вызовов
 const ACTIVE_SENTINEL_ABI = parseAbi([
@@ -44,27 +46,38 @@ export interface ExecutorConfig {
  */
 export class SentinelExecutor {
     private config: ExecutorConfig;
-    private nonceKeyMap: Map<string, bigint> = new Map();
-    private currentNonceKey: bigint = 0n;
+    private rateLimiter: PaymasterRateLimiter;
 
-    constructor(config: ExecutorConfig) {
+    constructor(config: ExecutorConfig, rateLimitConfig?: RateLimitConfig) {
         this.config = config;
+        this.rateLimiter = new PaymasterRateLimiter(
+            rateLimitConfig || {
+                maxOpsPerMinute: 5,
+                maxOpsPerHour: 30,
+                revertCooldownSec: 30,
+            }
+        );
     }
 
     /**
-     * Получает уникальный nonce key для пары токенов.
-     * ERC-4337 v0.7 поддерживает 2D nonces: key (192 bit) || seq (64 bit).
-     * Разные key = независимые последовательности = параллельные UserOps.
+     * Вычисляет уникальный nonce key для полного маршрута.
+     *
+     * ИСПРАВЛЕНО: Ранее использовалась пара tokenA/tokenB, что вызывало коллизию
+     * при одинаковом стартовом активе (USDC→WMNT vs USDC→FBTC получали одинаковый key).
+     *
+     * Теперь: uint192(bytes24(keccak256(abi.encode(tokenA, tokenB, dexPayloadRoute1))))
+     * Это гарантирует уникальность для каждого полного маршрута.
      */
-    private getNonceKey(tokenA: string, tokenB: string): bigint {
-        const pairId = `${tokenA.toLowerCase()}-${tokenB.toLowerCase()}`;
-
-        if (!this.nonceKeyMap.has(pairId)) {
-            this.nonceKeyMap.set(pairId, this.currentNonceKey);
-            this.currentNonceKey += 1n;
-        }
-
-        return this.nonceKeyMap.get(pairId)!;
+    private computeNonceKey(opportunity: ArbOpportunity): bigint {
+        const routeHash = keccak256(
+            encodePacked(
+                ["address", "address", "bytes"],
+                [opportunity.tokenA, opportunity.tokenB, opportunity.dexPayloadRoute1]
+            )
+        );
+        // Берём первые 24 байта (192 бита) хеша как nonce key
+        const keyHex = routeHash.slice(0, 50); // "0x" + 48 hex chars = 24 bytes
+        return BigInt(keyHex);
     }
 
     /**
@@ -100,6 +113,14 @@ export class SentinelExecutor {
         txHash: `0x${string}`;
         success: boolean;
     }> {
+        // ─── Step 0: Rate Limit Check ────────────────────────────────
+        const rateCheck = this.rateLimiter.canSend();
+        if (!rateCheck.allowed) {
+            throw new Error(
+                `Rate limited: ${rateCheck.reason}. Retry after ${rateCheck.retryAfterMs}ms`
+            );
+        }
+
         const publicClient = createPublicClient({
             transport: http(this.config.rpcUrl),
         });
@@ -131,8 +152,8 @@ export class SentinelExecutor {
             ],
         });
 
-        // ─── Step 3: 2D Nonce Key ────────────────────────────────────
-        const nonceKey = this.getNonceKey(opportunity.tokenA, opportunity.tokenB);
+        // ─── Step 3: 2D Nonce Key (route-based, collision-resistant) ─
+        const nonceKey = this.computeNonceKey(opportunity);
 
         // ─── Step 4: Create Kernel Client & Send UserOp ──────────────
         const sessionSigner = privateKeyToAccount(this.config.sessionPrivateKey);
@@ -177,11 +198,28 @@ export class SentinelExecutor {
             timeout: 30_000, // 30 seconds
         });
 
+        // ─── Step 7: Record result for rate limiting ─────────────────
+        this.rateLimiter.recordOp(receipt.success);
+
         return {
             userOpHash,
             txHash: receipt.receipt.transactionHash,
             success: receipt.success,
         };
+    }
+
+    /**
+     * Получить статус rate limiter (для мониторинга / HITL dashboard).
+     */
+    getRateLimitStatus() {
+        return this.rateLimiter.getStatus();
+    }
+
+    /**
+     * Принудительная разблокировка (вызывается оператором через Telegram HITL).
+     */
+    forceUnblock() {
+        this.rateLimiter.forceUnblock();
     }
 
     /**
