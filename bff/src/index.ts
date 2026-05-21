@@ -94,6 +94,11 @@ async function getOnChainPrice(tokenAddress: string): Promise<number> {
  * Фронтенд запрашивает детали proposal.
  * BFF верифицирует HMAC и проверяет staleness ПЕРЕД выдачей данных.
  *
+ * КРИТИЧНО (State Desync Fix):
+ * При выдаче payload ставим OPTIMISTIC LOCK (status → "dispensed") с TTL 60s.
+ * Если UserOp не подтвердится on-chain за 60s → auto-revert to "pending".
+ * Это гарантирует: даже если TMA закроется — nullifier не потеряется.
+ *
  * Headers required:
  *   X-HMAC-Signature: <hmac_hex>
  */
@@ -117,8 +122,8 @@ app.get("/api/proposal/:id", async (c) => {
 
     const proposal = JSON.parse(raw);
 
-    // ─── Status Check ────────────────────────────────────────────────
-    if (proposal.status !== "pending") {
+    // ─── Status Check (allow pending AND dispensed for retry) ────────
+    if (proposal.status !== "pending" && proposal.status !== "dispensed") {
         return c.json({ error: `Proposal already ${proposal.status}` }, 409);
     }
 
@@ -137,10 +142,29 @@ app.get("/api/proposal/:id", async (c) => {
             (currentPrice - proposal.priceAtGeneration) / proposal.priceAtGeneration
         );
         if (deviation > env.MAX_STALENESS_PCT / 100) {
-            // Не блокируем полностью — но предупреждаем + урезаем amount
             stalenessWarning = `Price moved ${(deviation * 100).toFixed(2)}% since generation`;
         }
     }
+
+    // ─── OPTIMISTIC LOCK: mark as "dispensed" ────────────────────────
+    // State Desync Fix: lock BEFORE returning payload.
+    // If /consume is never called (TMA crash), auto-revert after 60s.
+    proposal.status = "dispensed";
+    proposal.dispensedAt = now;
+    const remainingTtl = await redis.ttl(`proposal:${proposalId}`);
+    await redis.set(
+        `proposal:${proposalId}`,
+        JSON.stringify(proposal),
+        "EX",
+        Math.max(remainingTtl, 120)
+    );
+    // Schedule auto-revert (60s grace period for signing)
+    await redis.set(
+        `proposal_lock:${proposalId}`,
+        "dispensed",
+        "EX",
+        60 // Auto-expires → background worker reverts status
+    );
 
     // ─── Build EIP-712 Execution Payload ─────────────────────────────
     const executionPayload = buildExecutionPayload(proposal);

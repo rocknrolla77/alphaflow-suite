@@ -1,0 +1,104 @@
+# Файл: docker-compose.yml
+# AlphaFlow Suite — Full Stack (Dev/Staging)
+# Production TEE: deploy agent-tee separately via Phala DStack
+
+services:
+  # ─── Redis (State Store + Pub/Sub) ──────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD:-alphaflow_dev}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-alphaflow_dev}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ─── BFF (Backend-for-Frontend) ─────────────────────────────────────
+  bff:
+    build:
+      context: ./bff
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-alphaflow_dev}@redis:6379
+      - PROPOSAL_HMAC_SECRET=${PROPOSAL_HMAC_SECRET}
+      - MANTLE_RPC_PRIMARY=${MANTLE_RPC_PRIMARY:-https://rpc.mantle.xyz}
+      - MANTLE_RPC_FALLBACKS=${MANTLE_RPC_FALLBACKS:-https://rpc.mantle.xyz,https://rpc.ankr.com/mantle}
+      - ACTIVE_SENTINEL_ADDRESS=${ACTIVE_SENTINEL_ADDRESS}
+      - MAX_STALENESS_PCT=2
+      - TMA_ORIGIN=${TMA_ORIGIN:-http://localhost:5173}
+      - PORT=3001
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ─── Telegram Bot (HITL) ────────────────────────────────────────────
+  tg-bot:
+    build:
+      context: ./devops
+      dockerfile: Dockerfile
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-alphaflow_dev}@redis:6379
+      - TARGET_CHAT_ID=${TARGET_CHAT_ID}
+      - MINI_APP_URL=${MINI_APP_URL}
+      - PROPOSAL_HMAC_SECRET=${PROPOSAL_HMAC_SECRET}
+      - MAX_SLIPPAGE_PCT=2
+      - PROPOSAL_TTL_SEC=300
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ─── TEE Agent (Development Mode — NOT in CVM) ─────────────────────
+  # In production: deployed via `dstack deploy` to Phala Network
+  agent-tee-dev:
+    build:
+      context: ./agent-tee
+      dockerfile: Dockerfile
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-alphaflow_dev}@redis:6379
+      - TEE_SIGNER_PRIVATE_KEY=${TEE_SIGNER_PRIVATE_KEY}
+      - TEE_SIGNER_ADDRESS=${TEE_SIGNER_ADDRESS}
+      - NANSEN_API_KEY=${NANSEN_API_KEY}
+      - MANTLE_RPC_URL=${MANTLE_RPC_PRIMARY:-https://rpc.mantle.xyz}
+      - DSTACK_SIMULATOR_ENDPOINT=http://localhost:8090
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - dev  # Only runs in development
+
+  # ─── Anvil (Mantle Fork for Testing) ───────────────────────────────
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    command: >
+      anvil
+      --fork-url ${MANTLE_RPC_PRIMARY:-https://rpc.mantle.xyz}
+      --chain-id 5000
+      --block-time 2
+      --host 0.0.0.0
+      --port 8545
+    ports:
+      - "8545:8545"
+    profiles:
+      - test  # Only runs during testing
+
+volumes:
+  redis_data:
