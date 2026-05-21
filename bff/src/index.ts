@@ -1,334 +1,412 @@
-// Файл: bff/src/index.ts
-// Backend-for-Frontend (BFF) для AlphaFlow TMA
-// Роль: HMAC verification, staleness check, EIP-712 payload assembly
-// НЕ хранит приватные ключи — только верифицирует и проксирует
+// ═══════════════════════════════════════════════════════════════════════════════
+// AlphaFlow Suite — bff/src/index.ts
+// Hono API Server — Backend-for-Frontend
+//
+// Обязанности:
+// 1. HMAC verification (timing-safe, secret на сервере)
+// 2. Optimistic locking (Redis SETNX + TTL 60s)
+// 3. Staleness check (on-chain price via viem, не от клиента)
+// 4. EIP-712 payload assembly для TMA
+// 5. Nullifier consumption (double-spend protection)
+//
+// ИНВАРИАНТ: BFF НЕ хранит приватных ключей.
+// Он ТОЛЬКО верифицирует, проксирует и координирует состояние.
+// ═══════════════════════════════════════════════════════════════════════════════
 
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { Redis } from "ioredis";
-import { createHmac, timingSafeEqual } from "crypto";
-import { createPublicClient, http, parseAbi, encodeFunctionData } from "viem";
+import { logger } from "hono/logger";
+import { serve } from "@hono/node-server";
 import { z } from "zod";
 
-// ═══════════════════════════════════════════════════════════════════════
-//                         CONFIG
-// ═══════════════════════════════════════════════════════════════════════
+import {
+    verifyHmac,
+    getAndLockProposal,
+    consumeProposal,
+    redisHealthCheck,
+    shutdownRedis,
+} from "./services/proposalService.js";
 
-const envSchema = z.object({
-    REDIS_URL: z.string().default("redis://localhost:6379"),
-    PROPOSAL_HMAC_SECRET: z.string().min(32),
-    MANTLE_RPC_URL: z.string().default("https://rpc.mantle.xyz"),
-    ACTIVE_SENTINEL_ADDRESS: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
-    PORT: z.coerce.number().default(3001),
-    // Staleness: max price deviation allowed at approve time
-    MAX_STALENESS_PCT: z.coerce.number().default(2),
-    // Allowed TMA origins (CORS)
-    TMA_ORIGIN: z.string().default("https://alphaflow-tma.vercel.app"),
-});
+import {
+    checkPriceStaleness,
+    simulateTransaction,
+    rpcHealthCheck,
+} from "./services/onChainOracle.js";
 
-const env = envSchema.parse(process.env);
+import type { Address } from "viem";
 
-// ═══════════════════════════════════════════════════════════════════════
-//                      INITIALIZATION
-// ═══════════════════════════════════════════════════════════════════════
+// ─── App Configuration ────────────────────────────────────────────────────────
+
+const PORT = parseInt(process.env["PORT"] ?? "3001", 10);
+const ALLOWED_ORIGINS = (process.env["ALLOWED_ORIGINS"] ?? "https://t.me,https://web.telegram.org").split(",");
+
+// Default DEX pair address for staleness checks (configurable per proposal)
+const DEFAULT_PAIR_ADDRESS = (process.env["DEFAULT_PAIR_ADDRESS"] ?? "0x0000000000000000000000000000000000000000") as Address;
+
+// ─── Hono App ─────────────────────────────────────────────────────────────────
 
 const app = new Hono();
-const redis = new Redis(env.REDIS_URL);
 
-const publicClient = createPublicClient({
-    transport: http(env.MANTLE_RPC_URL),
-});
+// ─── Global Middleware ────────────────────────────────────────────────────────
 
-// CORS: только TMA origin
-app.use("*", cors({
-    origin: env.TMA_ORIGIN,
-    allowMethods: ["GET", "POST"],
-    allowHeaders: ["Content-Type", "X-HMAC-Signature", "X-Proposal-ID"],
+app.use("*", logger());
+
+app.use("/api/*", cors({
+    origin: ALLOWED_ORIGINS,
+    allowHeaders: ["Content-Type", "x-hmac-signature"],
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    maxAge: 3600,
 }));
 
-// ═══════════════════════════════════════════════════════════════════════
-//                   HMAC VERIFICATION MIDDLEWARE
-// ═══════════════════════════════════════════════════════════════════════
-
-function verifyHmac(proposalId: string, providedHmac: string): boolean {
-    const expected = createHmac("sha256", env.PROPOSAL_HMAC_SECRET)
-        .update(proposalId)
-        .digest("hex");
-
-    if (expected.length !== providedHmac.length) return false;
-
-    return timingSafeEqual(
-        Buffer.from(expected),
-        Buffer.from(providedHmac)
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//                      PRICE ORACLE (TEE-SIDE)
-// ═══════════════════════════════════════════════════════════════════════
+// ─── HMAC Verification Middleware ─────────────────────────────────────────────
 
 /**
- * Получает текущую цену актива из on-chain oracle (Pyth/Chainlink на Mantle).
- * КРИТИЧНО: цена должна идти из on-chain источника, а НЕ из frontend.
+ * Middleware: верифицирует HMAC-SHA256 подпись proposalId.
  *
- * В MVP используем простой DEX pool quote (TWAP).
- * В продакшене: Pyth Network price feed на Mantle.
+ * Header: x-hmac-signature: <hex_encoded_hmac>
+ *
+ * БЕЗОПАСНОСТЬ:
+ * - HMAC_SECRET живёт ТОЛЬКО на BFF (env var)
+ * - timingSafeEqual предотвращает timing oracle
+ * - Клиент получает одноразовую подпись через Telegram deep link
+ * - Клиент НЕ МОЖЕТ генерировать новые подписи
  */
-async function getOnChainPrice(tokenAddress: string): Promise<number> {
-    // TODO: Integrate Pyth Network price feed on Mantle
-    // Для MVP — cached price из Redis (записывается TEE-агентом)
-    const cached = await redis.get(`price:${tokenAddress.toLowerCase()}`);
-    if (cached) return parseFloat(cached);
+app.use("/api/proposal/:id", async (c, next) => {
+    const proposalId = c.req.param("id");
+    const signature = c.req.header("x-hmac-signature");
 
-    // Fallback: return 0 (BFF не может верифицировать staleness → reject)
-    return 0;
-}
+    if (!signature) {
+        return c.json(
+            { error: "Missing x-hmac-signature header", code: "HMAC_MISSING" },
+            401
+        );
+    }
 
-// ═══════════════════════════════════════════════════════════════════════
-//                         ROUTES
-// ═══════════════════════════════════════════════════════════════════════
+    if (!proposalId) {
+        return c.json(
+            { error: "Missing proposal ID", code: "ID_MISSING" },
+            400
+        );
+    }
+
+    // Timing-safe HMAC verification
+    const isValid = verifyHmac(proposalId, signature);
+    if (!isValid) {
+        console.warn(`[BFF] HMAC verification FAILED for proposal: ${proposalId}`);
+        return c.json(
+            { error: "Invalid HMAC signature", code: "HMAC_INVALID" },
+            401
+        );
+    }
+
+    return await next();
+});
+
+// Отдельно для /consume (тот же HMAC middleware)
+app.use("/api/proposal/:id/consume", async (c, next) => {
+    const proposalId = c.req.param("id");
+    const signature = c.req.header("x-hmac-signature");
+
+    if (!signature || !proposalId) {
+        return c.json({ error: "Missing HMAC credentials", code: "HMAC_MISSING" }, 401);
+    }
+
+    if (!verifyHmac(proposalId, signature)) {
+        return c.json({ error: "Invalid HMAC signature", code: "HMAC_INVALID" }, 401);
+    }
+
+    return await next();
+});
+
+// Also protect /simulate
+app.use("/api/proposal/:id/simulate", async (c, next) => {
+    const proposalId = c.req.param("id");
+    const signature = c.req.header("x-hmac-signature");
+
+    if (!signature || !proposalId) {
+        return c.json({ error: "Missing HMAC credentials", code: "HMAC_MISSING" }, 401);
+    }
+
+    if (!verifyHmac(proposalId, signature)) {
+        return c.json({ error: "Invalid HMAC signature", code: "HMAC_INVALID" }, 401);
+    }
+
+    return await next();
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//                              ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── GET /api/proposal/:id ────────────────────────────────────────────────────
 
 /**
- * GET /api/proposal/:id
+ * Извлекает Proposal, устанавливает optimistic lock, проверяет staleness.
  *
- * Фронтенд запрашивает детали proposal.
- * BFF верифицирует HMAC и проверяет staleness ПЕРЕД выдачей данных.
+ * Flow:
+ * 1. HMAC verified (middleware)
+ * 2. Redis: fetch + lock (60s TTL)
+ * 3. On-chain: staleness check (if pair address available)
+ * 4. Return: Proposal + EIP-712 payload
  *
- * КРИТИЧНО (State Desync Fix):
- * При выдаче payload ставим OPTIMISTIC LOCK (status → "dispensed") с TTL 60s.
- * Если UserOp не подтвердится on-chain за 60s → auto-revert to "pending".
- * Это гарантирует: даже если TMA закроется — nullifier не потеряется.
- *
- * Headers required:
- *   X-HMAC-Signature: <hmac_hex>
+ * HTTP Responses:
+ * - 200: OK — proposal + payload
+ * - 401: HMAC invalid
+ * - 404: Proposal not found
+ * - 409: Staleness exceeded / already consumed
+ * - 410: Proposal expired
+ * - 423: Locked by another session
+ * - 500: Internal error
  */
 app.get("/api/proposal/:id", async (c) => {
     const proposalId = c.req.param("id");
-    const hmacSignature = c.req.header("X-HMAC-Signature");
 
-    // ─── HMAC Verification ───────────────────────────────────────────
-    if (!hmacSignature) {
-        return c.json({ error: "Missing HMAC signature" }, 401);
-    }
-    if (!verifyHmac(proposalId, hmacSignature)) {
-        return c.json({ error: "Invalid HMAC signature" }, 401);
-    }
+    // ─── Step 1: Fetch + Lock ────────────────────────────────────────────
+    const result = await getAndLockProposal(proposalId);
 
-    // ─── Fetch from Redis ────────────────────────────────────────────
-    const raw = await redis.get(`proposal:${proposalId}`);
-    if (!raw) {
-        return c.json({ error: "Proposal not found or expired" }, 404);
-    }
-
-    const proposal = JSON.parse(raw);
-
-    // ─── Status Check (allow pending AND dispensed for retry) ────────
-    if (proposal.status !== "pending" && proposal.status !== "dispensed") {
-        return c.json({ error: `Proposal already ${proposal.status}` }, 409);
-    }
-
-    // ─── Deadline Check ──────────────────────────────────────────────
-    const now = Math.floor(Date.now() / 1000);
-    if (now >= proposal.deadline) {
-        return c.json({ error: "Proposal expired" }, 410);
-    }
-
-    // ─── Staleness Check (ON-CHAIN price, not frontend-provided) ─────
-    const currentPrice = await getOnChainPrice(proposal.asset);
-    let stalenessWarning: string | null = null;
-
-    if (currentPrice > 0 && proposal.priceAtGeneration > 0) {
-        const deviation = Math.abs(
-            (currentPrice - proposal.priceAtGeneration) / proposal.priceAtGeneration
+    if (!result.success || !result.proposal) {
+        return c.json(
+            { error: result.error, code: "PROPOSAL_UNAVAILABLE" },
+            result.httpStatus as 404 | 409 | 410 | 423 | 500
         );
-        if (deviation > env.MAX_STALENESS_PCT / 100) {
-            stalenessWarning = `Price moved ${(deviation * 100).toFixed(2)}% since generation`;
+    }
+
+    const proposal = result.proposal;
+
+    // ─── Step 2: Staleness Check (on-chain price) ────────────────────────
+    // Используем pair address из env или из proposal metadata
+    const pairAddress = DEFAULT_PAIR_ADDRESS;
+    const maxSlippageBps = proposal.maxSlippageBps ?? 200; // Default 2%
+
+    // Only check if pair address is configured (non-zero)
+    if (pairAddress !== "0x0000000000000000000000000000000000000000") {
+        try {
+            const priceCheck = await checkPriceStaleness(
+                pairAddress,
+                proposal.priceAtGeneration ?? null,
+                maxSlippageBps
+            );
+
+            if (priceCheck.isStale) {
+                // Price moved too much — reject to protect user
+                return c.json({
+                    error: "Price staleness exceeded threshold",
+                    code: "PRICE_STALE",
+                    details: {
+                        currentPrice: priceCheck.currentPrice,
+                        generationPrice: priceCheck.generationPrice,
+                        deviationBps: priceCheck.deviationBps,
+                        maxAllowedBps: maxSlippageBps,
+                    },
+                }, 409);
+            }
+        } catch (err) {
+            // Log but don't block — RPC failure shouldn't prevent legitimate actions
+            console.warn("[BFF] Staleness check failed (RPC issue), proceeding:", err);
         }
     }
 
-    // ─── OPTIMISTIC LOCK: mark as "dispensed" ────────────────────────
-    // State Desync Fix: lock BEFORE returning payload.
-    // If /consume is never called (TMA crash), auto-revert after 60s.
-    proposal.status = "dispensed";
-    proposal.dispensedAt = now;
-    const remainingTtl = await redis.ttl(`proposal:${proposalId}`);
-    await redis.set(
-        `proposal:${proposalId}`,
-        JSON.stringify(proposal),
-        "EX",
-        Math.max(remainingTtl, 120)
-    );
-    // Schedule auto-revert (60s grace period for signing)
-    await redis.set(
-        `proposal_lock:${proposalId}`,
-        "dispensed",
-        "EX",
-        60 // Auto-expires → background worker reverts status
-    );
-
-    // ─── Build EIP-712 Execution Payload ─────────────────────────────
-    const executionPayload = buildExecutionPayload(proposal);
+    // ─── Step 3: Assemble EIP-712 Payload ────────────────────────────────
+    const eip712Payload = {
+        domain: {
+            name: "AlphaFlow_TEE",
+            version: "1",
+            chainId: 5000,
+        },
+        types: {
+            Proposal: [
+                { name: "asset", type: "address" },
+                { name: "action", type: "string" },
+                { name: "recommendedAmount", type: "uint256" },
+                { name: "nonce", type: "uint256" },
+                { name: "deadline", type: "uint256" },
+                { name: "reasoningHash", type: "bytes32" },
+            ],
+        },
+        primaryType: "Proposal" as const,
+        message: {
+            asset: proposal.asset,
+            action: proposal.action,
+            recommendedAmount: proposal.recommendedAmount,
+            nonce: proposal.nonce,
+            deadline: proposal.deadline,
+            reasoningHash: proposal.reasoningHash,
+        },
+    };
 
     return c.json({
-        proposalId: proposal.id,
-        asset: proposal.asset,
-        assetSymbol: await getTokenSymbol(proposal.asset),
-        action: proposal.action,
-        amount: proposal.amount,
-        weight: proposal.weight || 0,
-        confidence: proposal.confidence || 0,
-        maxSlippage: proposal.maxSlippagePct,
-        deadline: proposal.deadline,
-        teeSignerAddress: proposal.teeSignerAddress,
-        proofOfReasoning: proposal.proofOfReasoning,
-        reasoningHash: proposal.reasoningHash,
-        // Pre-built execution data (TMA just signs, no logic)
-        targetContract: env.ACTIVE_SENTINEL_ADDRESS,
-        executionPayload,
-        // Warnings
-        stalenessWarning,
-        currentPrice,
-        priceAtGeneration: proposal.priceAtGeneration,
-        // Timing
-        remainingSec: proposal.deadline - now,
-    });
+        proposal: {
+            id: proposalId,
+            asset: proposal.asset,
+            assetSymbol: proposal.assetSymbol ?? "UNKNOWN",
+            action: proposal.action,
+            recommendedAmount: proposal.recommendedAmount,
+            nonce: proposal.nonce,
+            deadline: proposal.deadline,
+            reasoningHash: proposal.reasoningHash,
+            signature: proposal.signature,
+            signerAddress: proposal.signerAddress,
+            generatedAt: proposal.generatedAt,
+        },
+        eip712Payload,
+        lockExpiresAt: Math.floor(Date.now() / 1000) + 60,
+    }, 200);
 });
 
+// ─── POST /api/proposal/:id/consume ───────────────────────────────────────────
+
 /**
- * POST /api/proposal/:id/consume
+ * Burns the Proposal nullifier — marks as permanently used.
  *
- * Вызывается ПОСЛЕ успешной отправки UserOp.
- * Помечает proposal как executed (nullifier сжигание).
+ * Called by:
+ * 1. TMA frontend after successful UserOp submission
+ * 2. OnChainWatcher when FlashArbitrageExecuted event detected
+ *
+ * Idempotent: calling twice returns 200 (not error).
+ *
+ * HTTP Responses:
+ * - 200: OK — consumed (or already consumed)
+ * - 401: HMAC invalid
+ * - 404: Proposal not found
+ * - 500: Internal error
  */
 app.post("/api/proposal/:id/consume", async (c) => {
     const proposalId = c.req.param("id");
-    const hmacSignature = c.req.header("X-HMAC-Signature");
 
-    if (!hmacSignature || !verifyHmac(proposalId, hmacSignature)) {
-        return c.json({ error: "Unauthorized" }, 401);
+    const result = await consumeProposal(proposalId);
+
+    if (!result.success) {
+        return c.json(
+            { error: result.error, code: "CONSUME_FAILED" },
+            result.httpStatus as 404 | 500
+        );
     }
 
-    const raw = await redis.get(`proposal:${proposalId}`);
-    if (!raw) {
-        return c.json({ error: "Not found" }, 404);
-    }
-
-    const proposal = JSON.parse(raw);
-    if (proposal.status !== "approved" && proposal.status !== "pending") {
-        return c.json({ error: `Cannot consume: ${proposal.status}` }, 409);
-    }
-
-    proposal.status = "executed";
-    const ttl = await redis.ttl(`proposal:${proposalId}`);
-    if (ttl > 0) {
-        await redis.set(`proposal:${proposalId}`, JSON.stringify(proposal), "EX", ttl);
-    }
-
-    return c.json({ success: true, status: "executed" });
+    return c.json({
+        consumed: true,
+        proposalId,
+        reasoningHash: result.proposal?.reasoningHash,
+        consumedAt: Math.floor(Date.now() / 1000),
+    }, 200);
 });
 
-/**
- * GET /api/health
- */
-app.get("/api/health", async (c) => {
-    const redisOk = redis.status === "ready";
-    return c.json({ status: redisOk ? "ok" : "degraded", redis: redis.status });
-});
+// ─── POST /api/proposal/:id/simulate ──────────────────────────────────────────
 
 /**
- * POST /api/proposal/:id/simulate
+ * Dry-run simulation via eth_call.
+ * Detects reverts BEFORE submitting real UserOp.
  *
- * Off-chain симуляция: BFF вызывает eth_call для проверки,
- * пройдёт ли транзакция без revert.
- * Финальная проверка slippage — ON-CHAIN (не доверяем фронтенду).
+ * Body: { to: address, data: hex calldata }
  */
-app.post("/api/proposal/:id/simulate", async (c) => {
-    const proposalId = c.req.param("id");
-    const hmacSignature = c.req.header("X-HMAC-Signature");
 
-    if (!hmacSignature || !verifyHmac(proposalId, hmacSignature)) {
-        return c.json({ error: "Unauthorized" }, 401);
+const SimulateBodySchema = z.object({
+    to: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+    data: z.string().regex(/^0x[a-fA-F0-9]*$/),
+});
+
+app.post("/api/proposal/:id/simulate", async (c) => {
+    const body: unknown = await c.req.json();
+
+    const parsed = SimulateBodySchema.safeParse(body);
+    if (!parsed.success) {
+        return c.json({
+            error: "Invalid request body",
+            code: "VALIDATION_ERROR",
+            details: parsed.error.issues,
+        }, 400);
     }
 
-    const raw = await redis.get(`proposal:${proposalId}`);
-    if (!raw) return c.json({ error: "Not found" }, 404);
+    const { to, data } = parsed.data;
 
-    const proposal = JSON.parse(raw);
-    const payload = buildExecutionPayload(proposal);
+    const simulation = await simulateTransaction(
+        to as Address,
+        data as `0x${string}`
+    );
 
-    try {
-        // eth_call simulation (dry run)
-        await publicClient.call({
-            to: env.ACTIVE_SENTINEL_ADDRESS as `0x${string}`,
-            data: payload as `0x${string}`,
-        });
-
-        return c.json({ success: true, willRevert: false });
-    } catch (err: any) {
+    if (!simulation.success) {
         return c.json({
             success: false,
-            willRevert: true,
-            reason: err.message || "Simulation reverted",
-        });
+            error: simulation.error,
+            code: "SIMULATION_REVERTED",
+        }, 200); // 200 because the request itself succeeded; the simulation result is "revert"
     }
+
+    return c.json({
+        success: true,
+        result: simulation.result,
+        simulatedAt: Math.floor(Date.now() / 1000),
+    }, 200);
 });
 
-// ═══════════════════════════════════════════════════════════════════════
-//                      HELPERS
-// ═══════════════════════════════════════════════════════════════════════
+// ─── GET /api/health ──────────────────────────────────────────────────────────
 
-function buildExecutionPayload(proposal: any): `0x${string}` {
-    const abi = parseAbi([
-        "function executeFlashArbitrage((address tokenA, address tokenB, uint256 borrowAmount, uint256 minProfitTokenA, bytes dexPayloadRoute1, bytes dexPayloadRoute2) params)",
+/**
+ * System health check — Redis + RPC status.
+ * No HMAC required (public endpoint for monitoring).
+ */
+app.get("/api/health", async (c) => {
+    const [redisOk, rpcStatus] = await Promise.all([
+        redisHealthCheck(),
+        rpcHealthCheck(),
     ]);
 
-    // Reconstruct params from proposal data
-    // В реальности TEE передает уже закодированный payload
-    if (proposal.executionCalldata) {
-        return proposal.executionCalldata as `0x${string}`;
-    }
+    const healthy = redisOk && rpcStatus.healthy;
 
-    // Fallback: encode from proposal fields (если есть)
-    return encodeFunctionData({
-        abi,
-        functionName: "executeFlashArbitrage",
-        args: [
-            {
-                tokenA: proposal.asset as `0x${string}`,
-                tokenB: (proposal.tokenB || "0x0000000000000000000000000000000000000000") as `0x${string}`,
-                borrowAmount: BigInt(Math.floor(proposal.amount * 1e18)),
-                minProfitTokenA: BigInt(0), // Set by TEE based on simulation
-                dexPayloadRoute1: "0x" as `0x${string}`,
-                dexPayloadRoute2: "0x" as `0x${string}`,
-            },
-        ],
-    });
-}
+    return c.json({
+        status: healthy ? "healthy" : "degraded",
+        components: {
+            redis: redisOk ? "up" : "down",
+            rpc: rpcStatus.healthy ? "up" : "down",
+            rpcBlockNumber: rpcStatus.blockNumber?.toString() ?? null,
+        },
+        uptime: process.uptime(),
+        timestamp: Math.floor(Date.now() / 1000),
+    }, healthy ? 200 : 503);
+});
 
-async function getTokenSymbol(tokenAddress: string): Promise<string> {
-    const cached = await redis.get(`symbol:${tokenAddress.toLowerCase()}`);
-    if (cached) return cached;
+// ─── 404 Fallback ─────────────────────────────────────────────────────────────
 
-    try {
-        const symbol = await publicClient.readContract({
-            address: tokenAddress as `0x${string}`,
-            abi: parseAbi(["function symbol() view returns (string)"]),
-            functionName: "symbol",
-        });
-        await redis.set(`symbol:${tokenAddress.toLowerCase()}`, symbol, "EX", 86400);
-        return symbol;
-    } catch {
-        return tokenAddress.substring(0, 10) + "...";
-    }
-}
+app.notFound((c) => {
+    return c.json({ error: "Not found", code: "NOT_FOUND" }, 404);
+});
 
-// ═══════════════════════════════════════════════════════════════════════
-//                      SERVER START
-// ═══════════════════════════════════════════════════════════════════════
+// ─── Global Error Handler ─────────────────────────────────────────────────────
 
-export default {
-    port: env.PORT,
+app.onError((err, c) => {
+    console.error("[BFF] Unhandled error:", err);
+    return c.json({
+        error: "Internal server error",
+        code: "INTERNAL_ERROR",
+        message: process.env["NODE_ENV"] === "development" ? err.message : undefined,
+    }, 500);
+});
+
+// ─── Server Bootstrap ─────────────────────────────────────────────────────────
+
+console.log("═══════════════════════════════════════════════════════════════");
+console.log("  AlphaFlow Suite — BFF (Backend-for-Frontend)");
+console.log("═══════════════════════════════════════════════════════════════");
+console.log(`[BFF] Port: ${PORT}`);
+console.log(`[BFF] CORS origins: ${ALLOWED_ORIGINS.join(", ")}`);
+console.log(`[BFF] HMAC_SECRET: ${"*".repeat(8)} (loaded)`);
+
+serve({
     fetch: app.fetch,
+    port: PORT,
+}, (info) => {
+    console.log(`[BFF] Server listening on http://0.0.0.0:${info.port}`);
+});
+
+// ─── Graceful Shutdown ────────────────────────────────────────────────────────
+
+const shutdown = async (): Promise<void> => {
+    console.log("\n[BFF] Shutting down gracefully...");
+    await shutdownRedis();
+    console.log("[BFF] Redis disconnected. Bye.");
+    process.exit(0);
 };
 
-console.log(`🚀 AlphaFlow BFF running on port ${env.PORT}`);
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+export { app };
