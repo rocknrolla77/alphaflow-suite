@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // AlphaFlow Suite — agent-tee/src/strategies/yieldArchitect.ts
 // Стратегический модуль TEE-агента: расчёт объёмов + EIP-712 подпись
+// Phase 2: + Insight Hashing (Proof-of-Alpha)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { ethers, type Wallet, type HDNodeWallet, type TypedDataDomain, type TypedDataField } from "ethers";
@@ -23,6 +24,7 @@ const PROPOSAL_TYPES: Record<string, TypedDataField[]> = {
         { name: "nonce", type: "uint256" },
         { name: "deadline", type: "uint256" },
         { name: "reasoningHash", type: "bytes32" },
+        { name: "insightHash", type: "bytes32" },
     ],
 };
 
@@ -33,7 +35,8 @@ const PROPOSAL_TYPES: Record<string, TypedDataField[]> = {
  * 1. Расчёт объёма по формуле Smart Money Weight
  * 2. Валидация входных данных (bounds checking)
  * 3. Формирование reasoningHash (доказательство вычислимости)
- * 4. EIP-712 подпись Proposal ключом анклава
+ * 4. Формирование insightHash (детерминированный Proof-of-Alpha)
+ * 5. EIP-712 подпись Proposal ключом анклава
  *
  * ИНВАРИАНТ: приватный ключ (this.signer) НИКОГДА не покидает этот класс.
  * Единственный экспортируемый артефакт — SignedProposal (данные + подпись).
@@ -192,23 +195,65 @@ export class YieldArchitect {
     }
 
     /**
+     * Вычисление детерминированного insightHash для Proof-of-Alpha.
+     *
+     * Формула:
+     *   insightHash = keccak256(abi.encode(
+     *       ['address', 'string', 'uint256', 'uint256'],
+     *       [asset, action, recommendedAmount, timestamp]
+     *   ))
+     *
+     * ИНВАРИАНТ: хэш детерминирован — одинаковые входные данные = одинаковый хэш.
+     * Это позволяет верифицировать on-chain коммит: subgraph/indexer может
+     * воспроизвести хэш из данных proposal и сверить с event log.
+     *
+     * @param asset — адрес целевого актива (ERC-20)
+     * @param action — действие ("BUY" или "SELL")
+     * @param recommendedAmount — рекомендуемый объём (в wei)
+     * @param timestamp — Unix timestamp генерации инсайта
+     * @returns bytes32 hex-encoded keccak256 hash
+     */
+    public computeInsightHash(
+        asset: string,
+        action: string,
+        recommendedAmount: bigint,
+        timestamp: number
+    ): string {
+        const encoded = ethers.AbiCoder.defaultAbiCoder().encode(
+            ["address", "string", "uint256", "uint256"],
+            [asset, action, recommendedAmount, BigInt(timestamp)]
+        );
+
+        return ethers.keccak256(encoded);
+    }
+
+    /**
      * Генерация и подпись Proposal.
      *
      * Полный pipeline:
      * 1. calculateVolume → рекомендуемый объём
      * 2. computeReasoningHash → доказательство вычислимости
-     * 3. EIP-712 signTypedData → подпись ключом анклава
-     * 4. Инкремент nonce (monotonic, replay protection)
+     * 3. computeInsightHash → детерминированный Proof-of-Alpha hash
+     * 4. EIP-712 signTypedData → подпись ключом анклава
+     * 5. Инкремент nonce (monotonic, replay protection)
+     *
+     * ВАЖНО: insightHash и commitTxHash заполняются НА ЭТОМ этапе как placeholder.
+     * Pipeline (main.ts) отвечает за:
+     *   - on-chain commit insightHash → AlphaAuditor
+     *   - получение commitTxHash
+     *   - сборку финального SignedProposal
      *
      * @param signal — сигнал Smart Money от Nansen MCP
      * @param profile — риск-профиль пользователя
      * @param ttlSeconds — время жизни proposal (default 300 = 5 мин)
+     * @param commitTxHash — hash tx коммита в AlphaAuditor (передаётся из pipeline)
      * @returns SignedProposal готовый к публикации в Redis
      */
     public async generateProposal(
         signal: SmartMoneySignal,
         profile: UserRiskProfile,
-        ttlSeconds: number = 300
+        ttlSeconds: number = 300,
+        commitTxHash: `0x${string}` = "0x0000000000000000000000000000000000000000000000000000000000000000"
     ): Promise<SignedProposal> {
         // ─── Step 1: Расчёт объёма ───────────────────────────────────────
         const recommendedAmount = this.calculateVolume(signal, profile);
@@ -216,9 +261,18 @@ export class YieldArchitect {
         // ─── Step 2: Reasoning Hash ─────────────────────────────────────
         const reasoningHash = this.computeReasoningHash(signal, profile, recommendedAmount);
 
-        // ─── Step 3: Формирование Proposal ───────────────────────────────
+        // ─── Step 3: Insight Hash (Proof-of-Alpha) ──────────────────────
+        const timestamp = Math.floor(Date.now() / 1000);
+        const insightHash = this.computeInsightHash(
+            signal.asset,
+            signal.action,
+            recommendedAmount,
+            timestamp
+        );
+
+        // ─── Step 4: Формирование Proposal ───────────────────────────────
         const currentNonce = this.nonce;
-        const deadline = Math.floor(Date.now() / 1000) + ttlSeconds;
+        const deadline = timestamp + ttlSeconds;
 
         const proposal: Proposal = {
             asset: signal.asset,
@@ -227,9 +281,11 @@ export class YieldArchitect {
             nonce: currentNonce,
             deadline: deadline,
             reasoningHash: reasoningHash,
+            insightHash: insightHash,
+            commitTxHash: commitTxHash,
         };
 
-        // ─── Step 4: EIP-712 подпись ─────────────────────────────────────
+        // ─── Step 5: EIP-712 подпись ─────────────────────────────────────
         // signTypedData использует приватный ключ ТОЛЬКО в памяти.
         // Ключ никогда не сериализуется и не передаётся за пределы процесса.
         const signature = await this.signer.signTypedData(
@@ -242,18 +298,19 @@ export class YieldArchitect {
                 nonce: proposal.nonce,
                 deadline: proposal.deadline,
                 reasoningHash: proposal.reasoningHash,
+                insightHash: proposal.insightHash,
             }
         );
 
-        // ─── Step 5: Инкремент nonce (монотонный, необратимый) ───────────
+        // ─── Step 6: Инкремент nonce (монотонный, необратимый) ───────────
         this.nonce++;
 
-        // ─── Step 6: Сборка SignedProposal ───────────────────────────────
+        // ─── Step 7: Сборка SignedProposal ───────────────────────────────
         const signedProposal: SignedProposal = {
             ...proposal,
             signature: signature,
             signerAddress: this.signer.address,
-            generatedAt: Math.floor(Date.now() / 1000),
+            generatedAt: timestamp,
         };
 
         return signedProposal;
@@ -291,6 +348,7 @@ export class YieldArchitect {
                 nonce: proposal.nonce,
                 deadline: proposal.deadline,
                 reasoningHash: proposal.reasoningHash,
+                insightHash: proposal.insightHash,
             },
             signature
         );

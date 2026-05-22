@@ -90,6 +90,20 @@ export interface Proposal {
      *  Позволяет верифицировать: решение принято на основе этих конкретных данных.
      */
     readonly reasoningHash: string;
+
+    /**
+     * keccak256 хэш инсайта (Proof-of-Alpha).
+     * Закоммичен on-chain в AlphaAuditor ДО публикации proposal.
+     * encode(['address', 'string', 'uint256', 'uint256'], [asset, action, amount, timestamp])
+     */
+    readonly insightHash: string;
+
+    /**
+     * Transaction hash коммита insightHash в AlphaAuditor on-chain.
+     * Подтверждает, что insight зафиксирован до публикации рекомендации.
+     * Pipeline invariant: proposal НЕ публикуется без этого поля.
+     */
+    readonly commitTxHash: string;
 }
 
 /**
@@ -135,4 +149,36 @@ export interface AgentConfig {
 
     /** Включён ли режим Remote Attestation (false в dev) */
     readonly attestationEnabled: boolean;
+
+    /** Адрес контракта AlphaAuditor (Proof-of-Alpha Registry) */
+    readonly alphaAuditorAddress: string;
+
+    /** Agent ID (tokenId в SentinelIdentity) */
+    readonly agentId: bigint;
+}
+
+/**
+ * Конфигурация Rate Limiter.
+ */
+export interface RateLimitConfig {
+    readonly maxOpsPerMinute: number;
+    readonly maxOpsPerHour: number;
+    readonly revertCooldownSec: number;
+}
+
+/**
+ * Результат Proof-of-Alpha commit on-chain.
+ */
+export interface ProofOfAlphaCommitResult {
+    /** Transaction hash on-chain */
+    readonly txHash: `0x${string}`;
+
+    /** insight hash, закоммиченный в AlphaAuditor */
+    readonly insightHash: string;
+
+    /** Agent ID использованный при коммите */
+    readonly agentId: bigint;
+
+    /** Успешность отправки */
+    readonly success: boolean;
 }
