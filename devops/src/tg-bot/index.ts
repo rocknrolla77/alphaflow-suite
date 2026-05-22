@@ -1,22 +1,34 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // AlphaFlow Suite — devops/src/tg-bot/index.ts
-// Telegram HITL Bot — Telegraf v4 + Redis Pub/Sub + Whitelist
+// Telegram HITL Bot — Telegraf v4 + Redis Pub/Sub + Whitelist + Feedback Voting
 //
 // АРХИТЕКТУРА:
-// Redis channel "tee_proposals" → storeProposal() → broadcast()
-//   └── Inline Keyboard (WebApp button) → TMA opens with startapp param
+// Redis channel "tee_proposals" → storeProposal() → broadcastProposal()
+//   └── Inline Keyboard:
+//         [WebApp: Execute via Passkey]
+//         [👍 +1]  [👎 -1]         ← голосование
+//
+// ГОЛОСОВАНИЕ (callback_query):
+//   callback_data: "vote_up_{proposalId}" | "vote_down_{proposalId}"
+//   Защита от двойного голосования: Redis SETNX vote:{proposalId}:{userId}
+//   Метрики пишутся в Redis → BFF reputationBatcher.ts читает и отправляет в контракт
+//
+//   Redis ключи репутации:
+//     agent_feedback_score:{agentId}  → INCRBY +1/-1 (net score)
+//     agent_feedback_count:{agentId}  → INCR (total votes)
 //
 // БЕЗОПАСНОСТЬ:
-// - Whitelist middleware: только TARGET_CHAT_ID может управлять ботом
-// - HMAC_SECRET НИКОГДА не передаётся на клиент
-// - HMAC подпись кодируется в base64url для deep link
+//   - Whitelist middleware: только TARGET_CHAT_ID может управлять ботом
+//   - HMAC_SECRET НИКОГДА не передаётся на клиент
+//   - HMAC подпись кодируется в base64url для deep link
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import "dotenv/config";
 import { Telegraf, Markup } from "telegraf";
-import type { Context } from "telegraf";
+import type { Context, CallbackQuery } from "telegraf/types";
 import {
     getSubscriber,
+    getCommander,
     storeProposal,
     getRedisStatus,
     pauseBot,
@@ -36,14 +48,19 @@ if (!TARGET_CHAT_ID_RAW) throw new Error("FATAL: TARGET_CHAT_ID env var is requi
 const TARGET_CHAT_ID = parseInt(TARGET_CHAT_ID_RAW, 10);
 if (isNaN(TARGET_CHAT_ID)) throw new Error("FATAL: TARGET_CHAT_ID must be a valid integer");
 
-const TMA_URL = process.env["TMA_URL"] ?? "https://t.me/AlphaFlowBot/app";
+const TMA_URL      = process.env["TMA_URL"]      ?? "https://t.me/AlphaFlowBot/app";
 const BOT_USERNAME = process.env["BOT_USERNAME"] ?? "AlphaFlowBot";
+
+// agentId — токен из SentinelIdentity для TEE-агента (по умолчанию 1)
+// Устанавливается при деплое и прописывается в .env
+const DEFAULT_AGENT_ID = BigInt(process.env["DEFAULT_AGENT_ID"] ?? "1");
 
 console.log("═══════════════════════════════════════════════════════════════");
 console.log("  AlphaFlow Suite — Telegram HITL Bot");
 console.log("═══════════════════════════════════════════════════════════════");
 console.log(`[Bot] Target chat: ${TARGET_CHAT_ID}`);
 console.log(`[Bot] TMA URL: ${TMA_URL}`);
+console.log(`[Bot] Default agentId: ${DEFAULT_AGENT_ID}`);
 
 // ─── Telegraf Setup ───────────────────────────────────────────────────────────
 
@@ -53,17 +70,17 @@ const bot = new Telegraf(BOT_TOKEN);
 //
 // ИНВАРИАНТ БЕЗОПАСНОСТИ:
 // Бот принимает команды ТОЛЬКО от TARGET_CHAT_ID.
-// Все остальные запросы молча игнорируются (no reply — не раскрываем факт существования бота).
+// callback_query (кнопки) проверяются отдельно по user.id в чате.
 
 bot.use(async (ctx: Context, next) => {
     const chatId = ctx.chat?.id;
 
-    if (chatId !== TARGET_CHAT_ID) {
-        // Молча игнорируем — не отвечаем посторонним
+    // callback_query не содержит ctx.chat, проверяем через message
+    if (chatId !== undefined && chatId !== TARGET_CHAT_ID) {
         console.warn(
-            `[Bot] Ignored message from unauthorized chat: ${chatId ?? "unknown"}`
+            `[Bot] Ignored message from unauthorized chat: ${chatId}`
         );
-        return; // Drop — не вызываем next()
+        return;
     }
 
     return next();
@@ -84,11 +101,6 @@ bot.start(async (ctx) => {
 });
 
 // ─── /status Command ──────────────────────────────────────────────────────────
-//
-// Проверяет:
-// 1. Подключение к Redis (PING latency)
-// 2. Pause-флаг
-// 3. Количество обработанных сигналов
 
 bot.command("status", async (ctx) => {
     await ctx.sendChatAction("typing");
@@ -117,9 +129,6 @@ bot.command("status", async (ctx) => {
 });
 
 // ─── /pause Command ───────────────────────────────────────────────────────────
-//
-// Устанавливает bot:paused = "1" в Redis.
-// ProposalStore проверяет этот флаг перед приёмом каждого сигнала.
 
 bot.command("pause", async (ctx) => {
     await pauseBot();
@@ -154,6 +163,84 @@ bot.help(async (ctx) => {
     );
 });
 
+// ─── Callback Query Handler — Voting ─────────────────────────────────────────
+//
+// Обрабатывает нажатия кнопок 👍 / 👎.
+//
+// callback_data формат:
+//   "vote_up_{proposalId}_{agentId}"
+//   "vote_down_{proposalId}_{agentId}"
+//
+// Алгоритм:
+// 1. Парсим callback_data → direction + proposalId + agentId
+// 2. SETNX vote:{proposalId}:{userId} — защита от двойного голосования
+// 3. Если уже проголосовал → answerCallbackQuery с уведомлением
+// 4. Иначе: pipeline → INCRBY agent_feedback_score + INCR agent_feedback_count
+// 5. answerCallbackQuery + silent success
+
+bot.on("callback_query", async (ctx) => {
+    const query = ctx.callbackQuery as CallbackQuery.DataQuery;
+
+    if (!("data" in query)) {
+        await ctx.answerCbQuery();
+        return;
+    }
+
+    const data   = query.data;
+    const userId = query.from.id;
+
+    // ─── Parse callback_data ──────────────────────────────────────────────
+    // Format: "vote_up_{uuid}_{agentId}" or "vote_down_{uuid}_{agentId}"
+    const voteMatch = data.match(/^vote_(up|down)_([0-9a-f-]+)_(\d+)$/i);
+
+    if (!voteMatch) {
+        // Не наш callback — игнорируем
+        await ctx.answerCbQuery();
+        return;
+    }
+
+    const direction  = voteMatch[1] as "up" | "down";
+    const proposalId = voteMatch[2]!;
+    const agentId    = voteMatch[3]!;
+    const delta      = direction === "up" ? 1 : -1;
+
+    const r = getCommander();
+
+    // ─── Double-vote protection ───────────────────────────────────────────
+    // SETNX vote:{proposalId}:{userId} 1 (no TTL — голос должен жить вечно)
+    // Достаточно NX, так как нас устраивает persistent key
+    const voteKey = `vote:${proposalId}:${userId}`;
+    const wasSet  = await r.set(voteKey, "1", "NX");
+
+    if (wasSet === null) {
+        // Пользователь уже голосовал
+        await ctx.answerCbQuery("Вы уже проголосовали за этот сигнал.", { show_alert: false });
+        return;
+    }
+
+    // ─── Record metrics in Redis ──────────────────────────────────────────
+    // Эти ключи читает reputationBatcher.ts в BFF
+    //   agent_feedback_score:{agentId}  → net score (±1 per vote)
+    //   agent_feedback_count:{agentId}  → total votes
+    const scoreKey = `agent_feedback_score:${agentId}`;
+    const countKey = `agent_feedback_count:${agentId}`;
+
+    const pipeline = r.pipeline();
+    pipeline.incrby(scoreKey, delta);
+    pipeline.incr(countKey);
+    await pipeline.exec();
+
+    const emoji = direction === "up" ? "👍" : "👎";
+    const label = direction === "up" ? "+1 учтён" : "-1 учтён";
+
+    await ctx.answerCbQuery(`${emoji} ${label}. Спасибо за обратную связь!`, { show_alert: false });
+
+    console.log(
+        `[Bot] Vote recorded | proposalId=${proposalId} | agentId=${agentId} | ` +
+        `userId=${userId} | direction=${direction} | delta=${delta}`
+    );
+});
+
 // ─── Broadcast Proposal ───────────────────────────────────────────────────────
 
 /**
@@ -161,17 +248,20 @@ bot.help(async (ctx) => {
  *
  * Формирует:
  * - Подробное сообщение с параметрами сделки
- * - Inline кнопку WebApp с deep link URL
+ * - Inline кнопку WebApp + кнопки голосования 👍 / 👎
  *
- * Deep link формат:
- *   https://t.me/{BOT_USERNAME}/app?startapp={proposalId}_{hmacB64url}
+ * Keyboard layout:
+ *   [ ⚡ Execute via Passkey  ] (WebApp)
+ *   [ 👍 Хорошая стратегия ]  [ 👎 Сомнительная стратегия ]
  *
- * TMA парсит startapp → proposalId + hmacSignature для x-hmac-signature header.
+ * callback_data для голосования:
+ *   vote_up_{proposalId}_{agentId}
+ *   vote_down_{proposalId}_{agentId}
  *
- * @param proposal — StoredProposal (данные для отображения)
- * @param proposalId — UUID, сгенерированный ботом
- * @param hmacB64url — HMAC-SHA256(proposalId) в Base64url для URL
- * @param ttlSeconds — секунд до истечения proposal
+ * @param proposal    StoredProposal (данные для отображения)
+ * @param proposalId  UUID, сгенерированный ботом
+ * @param hmacB64url  HMAC-SHA256(proposalId) в Base64url для URL
+ * @param ttlSeconds  секунд до истечения proposal
  */
 async function broadcastProposal(
     proposal: StoredProposal,
@@ -218,20 +308,32 @@ async function broadcastProposal(
         `━━━━━━━━━━━━━━━━━━━━\n` +
         `🔐 *Proof-of-Reasoning:*\n` +
         `\`${reasoningShort}\`\n\n` +
-        `_Signed by TEE Signer: ${proposal.signerAddress.slice(0, 10)}..._`;
+        `_Signed by TEE Signer: ${proposal.signerAddress.slice(0, 10)}..._\n\n` +
+        `_Оцените стратегию для обновления репутации агента:_`;
 
     // ─── Deep link URL ────────────────────────────────────────────────────
-    // Формат: https://t.me/{bot}/app?startapp={id}_{sig}
-    // Telegram требует startapp без спецсимволов, поэтому Base64url
     const startappParam = `${proposalId}_${hmacB64url}`;
     const webAppUrl     = `https://t.me/${BOT_USERNAME}/app?startapp=${startappParam}`;
 
     // ─── Inline Keyboard ──────────────────────────────────────────────────
+    // Ряд 1: WebApp execute button
+    // Ряд 2: Vote buttons (callback_data включает proposalId + agentId)
+    const agentIdStr = DEFAULT_AGENT_ID.toString();
     const keyboard = Markup.inlineKeyboard([
         [
             Markup.button.webApp(
                 `${actionEmoji} Execute via Passkey`,
                 webAppUrl
+            ),
+        ],
+        [
+            Markup.button.callback(
+                "👍 Хорошая стратегия",
+                `vote_up_${proposalId}_${agentIdStr}`
+            ),
+            Markup.button.callback(
+                "👎 Сомнительная",
+                `vote_down_${proposalId}_${agentIdStr}`
             ),
         ],
     ]);
@@ -246,6 +348,7 @@ async function broadcastProposal(
         `[Bot] Broadcast proposal ${proposalId} | ` +
         `Action=${proposal.action} | ` +
         `Asset=${proposal.assetSymbol} | ` +
+        `AgentId=${agentIdStr} | ` +
         `TTL=${ttlSeconds}s`
     );
 }
@@ -257,7 +360,6 @@ async function broadcastProposal(
 //
 // ВАЖНО: subscriber клиент заблокирован в режиме subscribe
 // и не может выполнять другие Redis команды.
-// Для хранения используется отдельный commander клиент (из proposalStore).
 
 async function startRedisSubscription(): Promise<void> {
     const subscriber = getSubscriber();
@@ -268,7 +370,6 @@ async function startRedisSubscription(): Promise<void> {
         console.log(`[Redis:sub] Received signal on channel: ${channel}`);
 
         try {
-            // storeProposal проверяет pause, валидирует, сохраняет и возвращает ID+HMAC
             const result = await storeProposal(message);
 
             if (!result) {
@@ -276,9 +377,8 @@ async function startRedisSubscription(): Promise<void> {
                 return;
             }
 
-            // Для broadcast нам нужны данные proposal (достаём из сохранённого JSON)
             const stored = JSON.parse(message) as StoredProposal;
-            stored.id = result.proposalId;
+            stored.id        = result.proposalId;
             stored.createdAt = Math.floor(Date.now() / 1000);
 
             await broadcastProposal(
@@ -311,10 +411,7 @@ bot.catch((err: unknown, ctx: Context) => {
 // ─── Launch ───────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-    // 1. Start Redis Pub/Sub subscription
     await startRedisSubscription();
-
-    // 2. Launch Telegraf (long polling)
     await bot.launch();
     console.log("[Bot] Telegraf launched (long polling)");
     console.log("[Bot] Waiting for TEE signals...");

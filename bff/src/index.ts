@@ -35,6 +35,11 @@ import {
 
 import type { Address } from "viem";
 
+import {
+    startReputationBatcher,
+    stopReputationBatcher,
+} from "./services/reputationBatcher.js";
+
 // ─── App Configuration ────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env["PORT"] ?? "3001", 10);
@@ -395,12 +400,28 @@ serve({
     port: PORT,
 }, (info) => {
     console.log(`[BFF] Server listening on http://0.0.0.0:${info.port}`);
+
+    // ─── Start Reputation Batcher Daemon ──────────────────────────────────
+    // Агрегирует голоса из Redis и отправляет batch tx в ReputationRegistry.
+    // Запускается только если переменные окружения настроены.
+    if (
+        process.env["RELAYER_PRIVATE_KEY"] &&
+        process.env["REPUTATION_REGISTRY_ADDRESS"]
+    ) {
+        startReputationBatcher();
+    } else {
+        console.warn(
+            "[BFF] ReputationBatcher DISABLED " +
+            "(RELAYER_PRIVATE_KEY or REPUTATION_REGISTRY_ADDRESS not set)"
+        );
+    }
 });
 
 // ─── Graceful Shutdown ────────────────────────────────────────────────────────
 
 const shutdown = async (): Promise<void> => {
     console.log("\n[BFF] Shutting down gracefully...");
+    await stopReputationBatcher();
     await shutdownRedis();
     console.log("[BFF] Redis disconnected. Bye.");
     process.exit(0);
