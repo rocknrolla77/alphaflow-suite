@@ -1,13 +1,23 @@
-// Файл: agent-tee/src/services/remoteAttestation.ts
-// TEE Remote Attestation — Phala Network DStack / Intel SGX
+// ═══════════════════════════════════════════════════════════════════════════════
+// AlphaFlow Suite — agent-tee/src/services/remoteAttestation.ts
+// Phase 3: TEE Remote Attestation — включает Bloom Filter hash в reportData
+//
+// ИЗМЕНЕНИЯ PHASE 3:
+//   ✓ buildReportData() теперь принимает bloomFilterHash
+//   ✓ reportData = keccak256(abi.encode(proposalHash, bloomFilterHash))
+//   ✓ Это привязывает конфигурацию фильтра к attestation quote
+//
 // Доказывает: код agent-tee исполняется в настоящем анклаве,
-// не модифицирован администратором сервера.
+// не модифицирован администратором сервера, И использует конкретную
+// конфигурацию Bloom Filter (битовый массив N, хэш-функций K).
+// ═══════════════════════════════════════════════════════════════════════════════
 
 import { createHash } from "crypto";
+import { keccak256, encodePacked, type Hex } from "viem";
 
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 //                          TYPES
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 export interface AttestationQuote {
     /** Raw SGX Quote (hex-encoded) */
@@ -35,9 +45,19 @@ export interface AttestationVerification {
     dcapResult?: string;
 }
 
-// ═══════════════════════════════════════════════════════════════════════
+/**
+ * Phase 3: Параметры для построения reportData.
+ */
+export interface ReportDataParams {
+    /** keccak256 hash предложения (proposal) */
+    proposalHash: Hex;
+    /** keccak256 hash конфигурации Bloom Filter (из BloomFilter.getFilterConfigHash()) */
+    bloomFilterHash: Hex;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //                 PHALA DSTACK ATTESTATION
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 /**
  * Генерирует Remote Attestation Quote через Phala DStack API.
@@ -45,9 +65,12 @@ export interface AttestationVerification {
  * В CVM (Confidential Virtual Machine) доступен специальный endpoint:
  * http://localhost:8090/prpc/Phala.GetRemoteAttestation
  *
- * reportData: произвольные 64 байта, которые будут включены в quote.
- * Мы записываем туда keccak256(proposalHash || teeSignerAddress)
- * чтобы привязать attestation к конкретному Proposal.
+ * Phase 3 ИЗМЕНЕНИЕ:
+ *   reportData = keccak256(abi.encode(proposalHash, bloomFilterHash))
+ *   Это гарантирует:
+ *     1. Attestation привязана к конкретному Proposal
+ *     2. Attestation доказывает конфигурацию Bloom Filter
+ *        (следовательно — детерминизм решений фильтрации)
  */
 export class PhalaAttestationService {
     private dstackEndpoint: string;
@@ -59,7 +82,7 @@ export class PhalaAttestationService {
     /**
      * Генерирует SGX/TDX Quote с пользовательским reportData.
      *
-     * @param reportData — 64 bytes hex (обычно hash(proposal + signer))
+     * @param reportData — 64 bytes hex (комбинированный hash)
      * @returns Raw attestation quote
      */
     async generateQuote(reportData: string): Promise<AttestationQuote> {
@@ -105,13 +128,64 @@ export class PhalaAttestationService {
     }
 
     /**
-     * Создаёт reportData для привязки attestation к Proposal.
+     * Phase 3: Создаёт reportData с комбинированным хэшем.
      *
-     * Format: keccak256(reasoningHash || teeSignerAddress || nonce)
-     * Это гарантирует: attestation привязана к конкретному предложению,
-     * а не может быть переиспользована для другого.
+     * ФОРМУЛА: keccak256(abi.encode(proposalHash, bloomFilterHash))
+     *
+     * proposalHash — привязывает attestation к конкретному предложению.
+     * bloomFilterHash — доказывает конфигурацию фильтра (bitSize, hashCount).
+     *
+     * Результат обрезается до 64 bytes (128 hex chars) для SGX/TDX reportData.
+     *
+     * @param params.proposalHash — bytes32 hash предложения
+     * @param params.bloomFilterHash — bytes32 hash конфигурации Bloom Filter
+     * @returns 128 hex chars (64 bytes) для reportData
      */
-    buildReportData(
+    buildReportData(params: ReportDataParams): string {
+        const { proposalHash, bloomFilterHash } = params;
+
+        // Validate inputs
+        if (!proposalHash || !proposalHash.startsWith("0x") || proposalHash.length !== 66) {
+            throw new Error(
+                `Invalid proposalHash: expected bytes32, got ${proposalHash}`
+            );
+        }
+        if (!bloomFilterHash || !bloomFilterHash.startsWith("0x") || bloomFilterHash.length !== 66) {
+            throw new Error(
+                `Invalid bloomFilterHash: expected bytes32, got ${bloomFilterHash}`
+            );
+        }
+
+        // keccak256(abi.encode(proposalHash, bloomFilterHash))
+        const combinedHash = keccak256(
+            encodePacked(
+                ["bytes32", "bytes32"],
+                [proposalHash, bloomFilterHash]
+            )
+        );
+
+        // reportData = 64 bytes. combinedHash = 32 bytes (64 hex chars).
+        // Pad to 64 bytes (128 hex chars) with zeros.
+        const reportData = combinedHash.slice(2).padEnd(128, "0");
+
+        console.log(
+            `[Attestation] buildReportData:` +
+            `\n  proposalHash:    ${proposalHash}` +
+            `\n  bloomFilterHash: ${bloomFilterHash}` +
+            `\n  combinedHash:    ${combinedHash}` +
+            `\n  reportData:      ${reportData.slice(0, 32)}...`
+        );
+
+        return reportData;
+    }
+
+    /**
+     * @deprecated Phase 2 legacy — используйте buildReportData(params: ReportDataParams)
+     *
+     * Оставлен для обратной совместимости.
+     * Создаёт reportData БЕЗ bloomFilterHash (старый формат).
+     */
+    buildReportDataLegacy(
         reasoningHash: string,
         teeSignerAddress: string,
         nonce: number
@@ -144,9 +218,22 @@ export class PhalaAttestationService {
         }
     }
 
+    /**
+     * Phase 3: Полный flow — buildReportData + generateQuote.
+     *
+     * Convenience method для Pipeline:
+     *   1. Вычислить combined reportData
+     *   2. Запросить SGX/TDX quote с этим reportData
+     *   3. Вернуть готовый AttestationQuote
+     */
+    async attestProposal(params: ReportDataParams): Promise<AttestationQuote> {
+        const reportData = this.buildReportData(params);
+        return this.generateQuote(reportData);
+    }
+
+    // ─── Private: Verification Methods ────────────────────────────────────────
+
     private async verifyViaDcap(quote: AttestationQuote): Promise<AttestationVerification> {
-        // Phala Network DCAP Attestation Verifier
-        // Contract on Phala: 0x... (DCAP)
         const response = await fetch(
             `${this.dstackEndpoint}/prpc/Phala.VerifyAttestation`,
             {
@@ -172,7 +259,6 @@ export class PhalaAttestationService {
     }
 
     private async verifyViaIas(quote: AttestationQuote): Promise<AttestationVerification> {
-        // Intel Attestation Service (for legacy SGX quotes)
         const IAS_URL = "https://api.trustedservices.intel.com/sgx/dev/attestation/v4/report";
         const IAS_API_KEY = process.env.IAS_API_KEY;
 
@@ -203,14 +289,12 @@ export class PhalaAttestationService {
     // ─── Helpers ─────────────────────────────────────────────────────
 
     private extractMrenclave(rawQuote: string): string {
-        // SGX Quote format: MRENCLAVE is at offset 112, length 32 bytes
         const quoteBytes = Buffer.from(rawQuote, "hex");
         if (quoteBytes.length < 144) return "unknown";
         return quoteBytes.subarray(112, 144).toString("hex");
     }
 
     private extractMrsigner(rawQuote: string): string {
-        // MRSIGNER is at offset 176, length 32 bytes
         const quoteBytes = Buffer.from(rawQuote, "hex");
         if (quoteBytes.length < 208) return "unknown";
         return quoteBytes.subarray(176, 208).toString("hex");

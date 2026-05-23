@@ -1,7 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // AlphaFlow Suite — agent-tee/src/executor.ts
-// Модуль исполнения: арбитраж + Proof-of-Alpha commit через ZeroDev Session Key
-// Phase 2: + AlphaAuditor.commitInsight() интеграция
+// Phase 3: Модуль исполнения через Byreal OpenClaw + ZeroDev Session Key
+//
+// ИЗМЕНЕНИЯ PHASE 3:
+//   ✗ УДАЛЕНО: ручная сборка dexPayloadRoute1/Route2 для Merchant Moe / Agni
+//   ✓ ДОБАВЛЕНО: ByrealClient.buildExecutionPayload() для подготовки UserOperation
+//   ✓ ДОБАВЛЕНО: BloomFilter hash в attestation flow
 //
 // 2D Nonces (ERC-4337 v0.7) для параллельного пакетирования
 // ZeroDev SDK v5.5 API (constants.KERNEL_V3_1, kernelVersion обязателен)
@@ -15,18 +19,27 @@ import {
     keccak256,
     encodePacked,
     type Chain,
+    type Hex,
+    type Address,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { mantle } from "viem/chains";
 import { createKernelAccountClient, createKernelAccount, constants } from "@zerodev/sdk";
 import { signerToSessionKeyValidator } from "@zerodev/session-key";
 import { PaymasterRateLimiter } from "./services/rateLimiter.js";
+import { ByrealClient, type ByrealQuote, type ByrealExecutionPayload } from "./services/byrealClient.js";
+import { BloomFilter } from "./services/bloomFilter.js";
 import type { RateLimitConfig, ProofOfAlphaCommitResult } from "./types/index.js";
 
 // ─── ABI Definitions ──────────────────────────────────────────────────────────
 
+/**
+ * Phase 3: ABI ActiveSentinel обновлён.
+ * executeFlashArbitrage теперь принимает generic calldata от Byreal
+ * вместо захардкоженных dexPayloadRoute1/2.
+ */
 const ACTIVE_SENTINEL_ABI = parseAbi([
-    "function executeFlashArbitrage((address tokenA, address tokenB, uint256 borrowAmount, uint256 minProfitTokenA, uint256 amountOutMinRoute1, uint256 amountOutMinRoute2, bytes dexPayloadRoute1, bytes dexPayloadRoute2) params)",
+    "function executeFlashArbitrage(address borrowToken, uint256 borrowAmount, uint256 minProfit, address swapTarget, bytes calldata swapCalldata, uint256 deadline)",
 ]);
 
 const ALPHA_AUDITOR_ABI = parseAbi([
@@ -38,15 +51,24 @@ const ENTRYPOINT_ADDRESS_V07 = "0x0000000071727De22E5E9d8BAf0edAc6f37da032" as c
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+/**
+ * Phase 3: ArbOpportunity переработан.
+ * Вместо двух dexPayload (Route1/2), используем единый ByrealQuote.
+ * Маршрутизация полностью делегирована Byreal OpenClaw API.
+ */
 export interface ArbOpportunity {
-    tokenA: `0x${string}`;
-    tokenB: `0x${string}`;
+    /** Токен для flash borrow (из INIT Capital) */
+    borrowToken: Address;
+    /** Целевой токен свопа */
+    targetToken: Address;
+    /** Объём flash borrow (wei) */
     borrowAmount: bigint;
-    minProfitTokenA: bigint;
-    amountOutMinRoute1: bigint;
-    amountOutMinRoute2: bigint;
-    dexPayloadRoute1: `0x${string}`;
-    dexPayloadRoute2: `0x${string}`;
+    /** Минимальный профит в borrowToken (wei) */
+    minProfit: bigint;
+    /** Допустимый slippage (bps) */
+    slippageBps: number;
+    /** Deadline для исполнения (seconds from now) */
+    deadlineSeconds?: number;
 }
 
 export interface ExecutorConfig {
@@ -60,24 +82,45 @@ export interface ExecutorConfig {
     chainId: number;
 }
 
+/** Результат исполнения арбитража */
+export interface ArbExecutionResult {
+    userOpHash: `0x${string}`;
+    txHash: `0x${string}`;
+    success: boolean;
+    nonceKey: string;
+    /** Byreal quote ID использованный для маршрутизации */
+    quoteId: string;
+    /** Estimated output из Byreal */
+    estimatedOutput: bigint;
+}
+
 // ─── Executor Class ───────────────────────────────────────────────────────────
 
 /**
- * SentinelExecutor — отправляет UserOperations для:
- * 1. Flash Arbitrage (ActiveSentinel)
- * 2. Proof-of-Alpha commit (AlphaAuditor)
+ * SentinelExecutor — Phase 3: Byreal-powered execution.
  *
- * Ключевые особенности:
- * - 2D Nonce: каждый маршрут/контракт получает свой nonce key
- * - Gas Price Validation: отклоняет если baseFee > порога
- * - Rate Limiting: защита Gas Vault от drain
- * - Private Bundler: MEV protection
+ * КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ:
+ *   1. Вся DEX маршрутизация через ByrealClient (OpenClaw CLMM aggregation)
+ *   2. Bloom Filter hash включается в attestation data
+ *   3. Удалена ручная сборка calldata для Merchant Moe / Agni
+ *   4. Single calldata path вместо двух dexPayloadRoute (flash → swap → repay)
+ *
+ * FLOW:
+ *   ArbOpportunity → ByrealClient.getQuote() → ByrealClient.buildExecutionPayload()
+ *   → encodeFunctionData(ActiveSentinel.executeFlashArbitrage) → UserOperation
  */
 export class SentinelExecutor {
     private config: ExecutorConfig;
     private rateLimiter: PaymasterRateLimiter;
+    private byrealClient: ByrealClient;
+    private bloomFilter: BloomFilter | null = null;
 
-    constructor(config: ExecutorConfig, rateLimitConfig?: RateLimitConfig) {
+    constructor(
+        config: ExecutorConfig,
+        rateLimitConfig?: RateLimitConfig,
+        byrealClient?: ByrealClient,
+        bloomFilter?: BloomFilter
+    ) {
         this.config = config;
         this.rateLimiter = new PaymasterRateLimiter(
             rateLimitConfig || {
@@ -86,6 +129,8 @@ export class SentinelExecutor {
                 revertCooldownSec: 30,
             }
         );
+        this.byrealClient = byrealClient || new ByrealClient();
+        this.bloomFilter = bloomFilter || null;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -143,25 +188,20 @@ export class SentinelExecutor {
     }
 
     /**
-     * Вычисляет уникальный nonce key для полного маршрута.
-     * uint192(bytes24(keccak256(abi.encode(tokenA, tokenB, dexPayloadRoute1))))
-     * Reserved for future 2D nonce integration.
+     * Phase 3: Nonce key вычисляется из Byreal quoteId (уникальный per-route).
      */
-    public computeArbNonceKey(opportunity: ArbOpportunity): bigint {
+    public computeRouteNonceKey(quote: ByrealQuote): bigint {
         const routeHash = keccak256(
             encodePacked(
-                ["address", "address", "bytes"],
-                [opportunity.tokenA, opportunity.tokenB, opportunity.dexPayloadRoute1]
+                ["address", "address", "string"],
+                [quote.tokenIn, quote.tokenOut, quote.quoteId]
             )
         );
-        const keyHex = routeHash.slice(0, 50); // "0x" + 48 hex chars = 24 bytes = 192 bits
-        return BigInt(keyHex);
+        return BigInt(routeHash.slice(0, 50)); // uint192
     }
 
     /**
      * Фиксированный nonce key для AlphaAuditor коммитов.
-     * Отделён от арбитражных nonces для отсутствия конфликтов.
-     * Reserved for future 2D nonce integration.
      */
     public get auditorNonceKey(): bigint {
         const hash = keccak256(
@@ -170,7 +210,26 @@ export class SentinelExecutor {
                 ["alpha_auditor_commit", this.config.alphaAuditorAddress]
             )
         );
-        return BigInt(hash.slice(0, 50)); // 192 bits
+        return BigInt(hash.slice(0, 50));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //                    BLOOM FILTER INTEGRATION
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Устанавливает Bloom Filter для использования в attestation.
+     */
+    setBloomFilter(filter: BloomFilter): void {
+        this.bloomFilter = filter;
+    }
+
+    /**
+     * Возвращает hash конфигурации Bloom Filter.
+     * Используется в Remote Attestation (reportData = keccak256(proposalHash, bloomFilterHash)).
+     */
+    getBloomFilterHash(): Hex | null {
+        return this.bloomFilter?.getFilterConfigHash() ?? null;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -189,10 +248,6 @@ export class SentinelExecutor {
      *
      * ИНВАРИАНТ: если этот метод не возвращает успешный txHash,
      * proposal НЕ ДОЛЖЕН быть опубликован в Redis.
-     *
-     * @param insightHash — bytes32 хэш инсайта (из YieldArchitect.computeInsightHash)
-     * @returns ProofOfAlphaCommitResult с txHash для включения в Proposal
-     * @throws Error при любом сбое (RPC, bundler, rate limit, gas)
      */
     async commitProofOfAlpha(insightHash: string): Promise<ProofOfAlphaCommitResult> {
         // ─── Step 0: Validate insightHash format ──────────────────────────
@@ -281,25 +336,24 @@ export class SentinelExecutor {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //                    FLASH ARBITRAGE EXECUTION
+    //                    FLASH ARBITRAGE EXECUTION (PHASE 3: BYREAL)
     // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Выполняет арбитражную операцию через UserOperation.
+     * Phase 3: Выполняет арбитражную операцию через Byreal OpenClaw.
      *
-     * Flow:
+     * FLOW:
      * 1. Валидация gas price (отклонение при аномалии)
-     * 2. Кодирование calldata для executeFlashArbitrage
-     * 3. Назначение 2D nonce key по маршруту
-     * 4. Подписание и отправка через Bundler
-     * 5. Ожидание receipt
+     * 2. ByrealClient.getQuote() — получить оптимальный CLMM маршрут
+     * 3. ByrealClient.buildExecutionPayload() — собрать calldata
+     * 4. Encode calldata для ActiveSentinel.executeFlashArbitrage
+     * 5. Подписание и отправка через Bundler
+     * 6. Ожидание receipt
+     *
+     * ИНВАРИАНТ: TEE-агент НЕ собирает calldata для DEX вручную.
+     * Byreal отвечает за fee tiers, tick ranges, split routing.
      */
-    async executeArbitrage(opportunity: ArbOpportunity): Promise<{
-        userOpHash: `0x${string}`;
-        txHash: `0x${string}`;
-        success: boolean;
-        nonceKey: string;
-    }> {
+    async executeArbitrage(opportunity: ArbOpportunity): Promise<ArbExecutionResult> {
         // ─── Step 0: Rate Limit Check ────────────────────────────────
         const rateCheck = this.rateLimiter.canSend();
         if (!rateCheck.allowed) {
@@ -322,28 +376,72 @@ export class SentinelExecutor {
             );
         }
 
-        // ─── Step 2: Encode calldata ─────────────────────────────────
+        // ─── Step 2: Get Quote from Byreal OpenClaw ──────────────────
+        console.log(
+            `[Executor] Requesting Byreal quote: ` +
+            `${opportunity.borrowToken.slice(0, 10)} → ${opportunity.targetToken.slice(0, 10)} ` +
+            `amount=${opportunity.borrowAmount}`
+        );
+
+        const quote = await this.byrealClient.getQuote(
+            opportunity.borrowToken,
+            opportunity.targetToken,
+            opportunity.borrowAmount
+        );
+
+        // Validate quote freshness
+        if (!this.byrealClient.isQuoteValid(quote)) {
+            throw new Error(
+                `[Executor] Byreal quote expired: quoteId=${quote.quoteId}, ` +
+                `expiresAt=${quote.expiresAt}`
+            );
+        }
+
+        // Validate price impact threshold (reject if > 3%)
+        if (quote.priceImpactBps > 300) {
+            throw new Error(
+                `[Executor] Price impact too high: ${quote.priceImpactBps} bps (max: 300). ` +
+                `Route: ${quote.routes.map(r => r.protocol).join(" → ")}`
+            );
+        }
+
+        console.log(
+            `[Executor] Byreal quote received: quoteId=${quote.quoteId}, ` +
+            `estimatedOut=${quote.estimatedAmountOut}, ` +
+            `impact=${quote.priceImpactBps}bps, ` +
+            `routes=${quote.routes.length}`
+        );
+
+        // ─── Step 3: Build Execution Payload ─────────────────────────
+        const payload = await this.byrealClient.buildExecutionPayload(
+            quote.quoteId,
+            opportunity.slippageBps,
+            this.config.activeSentinelAddress,
+            opportunity.deadlineSeconds || 300
+        );
+
+        // ─── Step 4: Encode ActiveSentinel calldata ──────────────────
         const callData = encodeFunctionData({
             abi: ACTIVE_SENTINEL_ABI,
             functionName: "executeFlashArbitrage",
             args: [
-                {
-                    tokenA: opportunity.tokenA,
-                    tokenB: opportunity.tokenB,
-                    borrowAmount: opportunity.borrowAmount,
-                    minProfitTokenA: opportunity.minProfitTokenA,
-                    amountOutMinRoute1: opportunity.amountOutMinRoute1,
-                    amountOutMinRoute2: opportunity.amountOutMinRoute2,
-                    dexPayloadRoute1: opportunity.dexPayloadRoute1,
-                    dexPayloadRoute2: opportunity.dexPayloadRoute2,
-                },
+                opportunity.borrowToken,       // borrowToken
+                opportunity.borrowAmount,       // borrowAmount
+                opportunity.minProfit,          // minProfit
+                payload.to,                     // swapTarget (Byreal router)
+                payload.data,                   // swapCalldata (from Byreal)
+                BigInt(payload.deadline),        // deadline
             ],
         });
 
-        // ─── Step 3: Create Kernel Client ────────────────────────────
+        // ─── Step 5: Create Kernel Client ────────────────────────────
         const kernelClient = await this.createKernelClient(publicClient);
 
-        // ─── Step 4: Send UserOperation ──────────────────────────────
+        // ─── Step 6: Send UserOperation ──────────────────────────────
+        console.log(
+            `[Executor] Sending flash arb UserOp via Byreal route...`
+        );
+
         const userOpHash = await kernelClient.sendUserOperation({
             callData: await kernelClient.account.encodeCalls([{
                 to: this.config.activeSentinelAddress,
@@ -352,20 +450,33 @@ export class SentinelExecutor {
             }]),
         });
 
-        // ─── Step 5: Wait for receipt ────────────────────────────────
+        // ─── Step 7: Wait for receipt ────────────────────────────────
         const receipt = await kernelClient.waitForUserOperationReceipt({
             hash: userOpHash,
             timeout: 30_000,
         });
 
-        // ─── Step 6: Record result for rate limiting ─────────────────
+        // ─── Step 8: Record result for rate limiting ─────────────────
         this.rateLimiter.recordOp(receipt.success);
+
+        if (receipt.success) {
+            console.log(
+                `[Executor] ✓ Arbitrage executed. txHash=${receipt.receipt.transactionHash}, ` +
+                `quoteId=${quote.quoteId}`
+            );
+        } else {
+            console.error(
+                `[Executor] ✗ Arbitrage reverted. txHash=${receipt.receipt.transactionHash}`
+            );
+        }
 
         return {
             userOpHash,
             txHash: receipt.receipt.transactionHash,
             success: receipt.success,
-            nonceKey: this.computeArbNonceKey(opportunity).toString(16),
+            nonceKey: this.computeRouteNonceKey(quote).toString(16),
+            quoteId: quote.quoteId,
+            estimatedOutput: quote.estimatedAmountOut,
         };
     }
 
@@ -374,12 +485,14 @@ export class SentinelExecutor {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /**
-     * Получить статус rate limiter (для мониторинга / HITL dashboard).
+     * Получить статус rate limiter + Byreal stats (для мониторинга / HITL dashboard).
      */
     getRateLimitStatus() {
         return {
             ...this.rateLimiter.getStatus(),
             auditorNonceKey: this.auditorNonceKey.toString(16),
+            byrealStats: this.byrealClient.getStats(),
+            bloomFilterStats: this.bloomFilter?.getStats() ?? null,
         };
     }
 
@@ -392,18 +505,22 @@ export class SentinelExecutor {
 
     /**
      * Batch execution: отправляет несколько арбитражных операций параллельно.
-     * Каждая пара использует свой nonce key — нет конфликтов.
+     * Каждая пара получает уникальный Byreal quote → уникальный nonce key.
      */
     async executeBatch(
         opportunities: ArbOpportunity[]
-    ): Promise<Array<{ success: boolean; hash?: `0x${string}`; error?: string }>> {
+    ): Promise<Array<{ success: boolean; hash?: `0x${string}`; error?: string; quoteId?: string }>> {
         const results = await Promise.allSettled(
             opportunities.map((opp) => this.executeArbitrage(opp))
         );
 
         return results.map((result) => {
             if (result.status === "fulfilled") {
-                return { success: result.value.success, hash: result.value.txHash };
+                return {
+                    success: result.value.success,
+                    hash: result.value.txHash,
+                    quoteId: result.value.quoteId,
+                };
             } else {
                 return { success: false, error: result.reason?.message || "Unknown error" };
             }
