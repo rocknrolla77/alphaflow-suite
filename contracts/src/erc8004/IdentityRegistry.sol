@@ -155,4 +155,21 @@ contract IdentityRegistry is ERC721URIStorage {
     {
         return super.tokenURI(tokenId);
     }
+
+    /// @dev Soulbound Token: запрет на передачу (только mint и burn)
+    /// AI-агент навсегда привязан к адресу создателя/smart account.
+    /// Это также гарантирует синхронизацию маппинга agentOf.
+    function _update(address to, uint256 tokenId, address auth)
+        internal
+        override
+        returns (address)
+    {
+        address from = _ownerOf(tokenId);
+        // Разрешаем только mint (from == 0) и burn (to == 0)
+        require(
+            from == address(0) || to == address(0),
+            "IdentityRegistry: Agents are Soulbound and cannot be transferred"
+        );
+        return super._update(to, tokenId, auth);
+    }
 }
