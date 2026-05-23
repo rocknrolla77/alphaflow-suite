@@ -21,44 +21,48 @@ contract DeployActiveSentinel is Script {
         address dexA = vm.envOr("DEX_ROUTER_A", MERCHANT_MOE_ROUTER);
         address dexB = vm.envOr("DEX_ROUTER_B", AGNI_ROUTER);
         address oracleRelayer = vm.envAddress("ORACLE_RELAYER_ADDRESS");
+        address teeAgent = vm.envAddress("TEE_AGENT_ADDRESS");
 
         require(initCore != address(0), "INIT_CORE not set");
         require(dexA != address(0), "DEX_ROUTER_A not set");
         require(dexB != address(0), "DEX_ROUTER_B not set");
         require(oracleRelayer != address(0), "ORACLE_RELAYER_ADDRESS not set");
+        require(teeAgent != address(0), "TEE_AGENT_ADDRESS not set");
 
         vm.startBroadcast(deployerKey);
 
-        // ─── 1. ActiveSentinel ─────────────────────────────────────────
-        ActiveSentinel sentinel = new ActiveSentinel(initCore, dexA, dexB);
+        // 1. ActiveSentinel (Hardened)
+        ActiveSentinel sentinel = new ActiveSentinel(initCore, dexA, dexB, teeAgent);
         console2.log("ActiveSentinel deployed at:", address(sentinel));
         console2.log("  Owner:", sentinel.owner());
+        console2.log("  TEE Agent:", sentinel.authorizedTeeAgent());
 
-        // ─── 2. SentinelIdentity (ERC-721) ─────────────────────────────
+        // 2. SentinelIdentity (ERC-721)
         SentinelIdentity identity = new SentinelIdentity();
         console2.log("SentinelIdentity deployed at:", address(identity));
 
-        // ─── 3. AlphaAuditor ───────────────────────────────────────────
+        // 3. AlphaAuditor
         AlphaAuditor auditor = new AlphaAuditor(address(identity));
         console2.log("AlphaAuditor deployed at:", address(auditor));
 
-        // ─── 4. ReputationRegistry ─────────────────────────────────────
+        // 4. ReputationRegistry
         ReputationRegistry reputation = new ReputationRegistry(oracleRelayer);
         console2.log("ReputationRegistry deployed at:", address(reputation));
         console2.log("  Oracle (BFF Relayer):", reputation.oracle());
 
         vm.stopBroadcast();
 
-        // ─── Summary ───────────────────────────────────────────────────
+        // Summary
         console2.log("");
-        console2.log("═══════════════════════════════════════════════════════");
+        console2.log("====================================================");
         console2.log("  DEPLOYMENT SUMMARY");
-        console2.log("═══════════════════════════════════════════════════════");
+        console2.log("====================================================");
         console2.log("  ActiveSentinel:      ", address(sentinel));
         console2.log("  SentinelIdentity:    ", address(identity));
         console2.log("  AlphaAuditor:        ", address(auditor));
         console2.log("  ReputationRegistry:  ", address(reputation));
+        console2.log("  TEE Agent:           ", teeAgent);
         console2.log("  Oracle Relayer:      ", oracleRelayer);
-        console2.log("═══════════════════════════════════════════════════════");
+        console2.log("====================================================");
     }
 }

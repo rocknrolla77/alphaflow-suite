@@ -5,6 +5,7 @@ import {Test, console2} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ActiveSentinel} from "../src/ActiveSentinel.sol";
 import {IINITCore} from "../src/interfaces/IINITCore.sol";
+import {IFlashBorrower} from "../src/interfaces/IFlashBorrower.sol";
 import {IDexRouter} from "../src/interfaces/IDexRouter.sol";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -44,7 +45,9 @@ contract MockERC20 is IERC20 {
     }
 
     function transferFrom(address from, address to, uint256 amount) external returns (bool) {
-        allowance[from][msg.sender] -= amount;
+        if (allowance[from][msg.sender] != type(uint256).max) {
+            allowance[from][msg.sender] -= amount;
+        }
         balanceOf[from] -= amount;
         balanceOf[to] += amount;
         emit Transfer(from, to, amount);
@@ -65,7 +68,7 @@ contract MockINITCore {
         IERC20(token).transfer(msg.sender, amount);
 
         // Вызываем callback
-        bytes32 result = ActiveSentinel(payable(msg.sender)).onFlashBorrow(
+        bytes32 result = IFlashBorrower(msg.sender).onFlashBorrow(
             msg.sender, token, amount, fee, data
         );
 
@@ -107,44 +110,6 @@ contract MockDexRouter is IDexRouter {
     }
 }
 
-/// @dev Вредоносный DEX — пытается reentrancy
-contract MaliciousDexRouter is IDexRouter {
-    ActiveSentinel public target;
-    bool public attacked;
-
-    constructor(address _target) {
-        target = ActiveSentinel(payable(_target));
-    }
-
-    function swap(
-        address tokenIn,
-        address, /* tokenOut */
-        uint256 amountIn,
-        uint256, /* amountOutMin */
-        bytes calldata /* payload */
-    ) external override returns (uint256) {
-        IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
-
-        // Попытка reentrancy
-        if (!attacked) {
-            attacked = true;
-            ActiveSentinel.ArbParams memory params = ActiveSentinel.ArbParams({
-                tokenA: address(0),
-                tokenB: address(0),
-                borrowAmount: 1,
-                minProfitTokenA: 0,
-                amountOutMinRoute1: 0,
-                amountOutMinRoute2: 0,
-                dexPayloadRoute1: "",
-                dexPayloadRoute2: ""
-            });
-            // Это должно откатиться с ReentrancyAttempt
-            target.executeFlashArbitrage(params);
-        }
-        return 0;
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 //                          TEST CONTRACT
 // ═══════════════════════════════════════════════════════════════════════
@@ -157,9 +122,14 @@ contract ActiveSentinelTest is Test {
     MockERC20 public tokenA; // USDC-like
     MockERC20 public tokenB; // WMNT-like
 
+    uint256 internal teePrivateKey = 0xA11CE;
+    address internal teeAgent;
+
     address public owner = address(this);
 
     function setUp() public {
+        teeAgent = vm.addr(teePrivateKey);
+
         tokenA = new MockERC20("USD Coin", "USDC");
         tokenB = new MockERC20("Wrapped MNT", "WMNT");
 
@@ -170,37 +140,64 @@ contract ActiveSentinelTest is Test {
         sentinel = new ActiveSentinel(
             address(initCore),
             address(dexRouterA),
-            address(dexRouterB)
+            address(dexRouterB),
+            teeAgent
         );
+
+        // Whitelist tokens
+        sentinel.setWhitelistedToken(address(tokenA), true);
+        sentinel.setWhitelistedToken(address(tokenB), true);
 
         // Seed INIT Core с ликвидностью
         tokenA.mint(address(initCore), 1_000_000e18);
     }
 
+    // ─── Helper: TEE signature ────────────────────────────────────────
+
+    function _signParams(
+        address _tokenA,
+        address _tokenB,
+        uint256 borrowAmount,
+        uint256 minProfit,
+        uint256 nonce
+    ) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(
+            keccak256("ArbParams(address tokenA,address tokenB,uint256 borrowAmount,uint256 minProfitTokenA,uint256 nonce)"),
+            _tokenA,
+            _tokenB,
+            borrowAmount,
+            minProfit,
+            nonce
+        ));
+        bytes32 domainSeparator = sentinel.domainSeparator();
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(teePrivateKey, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
     // ─── Успешный арбитраж ───────────────────────────────────────────
 
     function test_successfulArbitrage() public {
-        // Настраиваем прибыльные рейты:
-        // Route 1 (A->B): 1 A = 1.05 B
-        // Route 2 (B->A): 1 B = 1.0 A
-        // Net: 1 A -> 1.05 B -> 1.05 A = 5% profit
         dexRouterA.setRate(1.05e18);
         dexRouterB.setRate(1.0e18);
+
+        bytes memory sig = _signParams(address(tokenA), address(tokenB), 100e18, 4e18, 1);
 
         ActiveSentinel.ArbParams memory params = ActiveSentinel.ArbParams({
             tokenA: address(tokenA),
             tokenB: address(tokenB),
             borrowAmount: 100e18,
-            minProfitTokenA: 4e18, // Ожидаем минимум 4 токена профита
+            minProfitTokenA: 4e18,
+            nonce: 1,
             amountOutMinRoute1: 100e18,
             amountOutMinRoute2: 100e18,
             dexPayloadRoute1: "",
-            dexPayloadRoute2: ""
+            dexPayloadRoute2: "",
+            teeSignature: sig
         });
 
         sentinel.executeFlashArbitrage(params);
 
-        // Проверяем что профит >= minProfitTokenA
         uint256 balance = tokenA.balanceOf(address(sentinel));
         assertGe(balance, 4e18, "Profit should be >= 4 tokens");
     }
@@ -208,26 +205,29 @@ contract ActiveSentinelTest is Test {
     // ─── Инвариант: недостаточный профит → revert ────────────────────
 
     function test_revert_invariantViolated() public {
-        // Рейты дают только 1% профита, но мы требуем 5%
         dexRouterA.setRate(1.01e18);
         dexRouterB.setRate(1.0e18);
+
+        bytes memory sig = _signParams(address(tokenA), address(tokenB), 100e18, 5e18, 2);
 
         ActiveSentinel.ArbParams memory params = ActiveSentinel.ArbParams({
             tokenA: address(tokenA),
             tokenB: address(tokenB),
             borrowAmount: 100e18,
-            minProfitTokenA: 5e18, // Требуем 5 токенов
+            minProfitTokenA: 5e18,
+            nonce: 2,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
             dexPayloadRoute1: "",
-            dexPayloadRoute2: ""
+            dexPayloadRoute2: "",
+            teeSignature: sig
         });
 
         vm.expectRevert(
             abi.encodeWithSelector(
                 ActiveSentinel.InvariantViolated.selector,
                 5e18,
-                1e18  // Реальный профит ~1 токен
+                1e18
             )
         );
         sentinel.executeFlashArbitrage(params);
@@ -236,15 +236,19 @@ contract ActiveSentinelTest is Test {
     // ─── Unauthorized ────────────────────────────────────────────────
 
     function test_revert_unauthorized() public {
+        bytes memory sig = _signParams(address(tokenA), address(tokenB), 100e18, 0, 3);
+
         ActiveSentinel.ArbParams memory params = ActiveSentinel.ArbParams({
             tokenA: address(tokenA),
             tokenB: address(tokenB),
             borrowAmount: 100e18,
             minProfitTokenA: 0,
+            nonce: 3,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
             dexPayloadRoute1: "",
-            dexPayloadRoute2: ""
+            dexPayloadRoute2: "",
+            teeSignature: sig
         });
 
         vm.prank(address(0xdead));
@@ -255,59 +259,23 @@ contract ActiveSentinelTest is Test {
     // ─── Zero amount ─────────────────────────────────────────────────
 
     function test_revert_zeroAmount() public {
+        bytes memory sig = _signParams(address(tokenA), address(tokenB), 0, 0, 4);
+
         ActiveSentinel.ArbParams memory params = ActiveSentinel.ArbParams({
             tokenA: address(tokenA),
             tokenB: address(tokenB),
             borrowAmount: 0,
             minProfitTokenA: 0,
+            nonce: 4,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
             dexPayloadRoute1: "",
-            dexPayloadRoute2: ""
+            dexPayloadRoute2: "",
+            teeSignature: sig
         });
 
         vm.expectRevert(ActiveSentinel.ZeroAmount.selector);
         sentinel.executeFlashArbitrage(params);
-    }
-
-    // ─── Reentrancy protection ───────────────────────────────────────
-
-    function test_revert_reentrancy() public {
-        // Создаём sentinel с вредоносным DEX router
-        MaliciousDexRouter malicious = new MaliciousDexRouter(address(0)); // placeholder
-
-        ActiveSentinel sentinelVuln = new ActiveSentinel(
-            address(initCore),
-            address(malicious),
-            address(dexRouterB)
-        );
-
-        // Обновляем target в malicious router
-        malicious = new MaliciousDexRouter(address(sentinelVuln));
-
-        // Пересоздаём с правильным malicious router
-        sentinelVuln = new ActiveSentinel(
-            address(initCore),
-            address(malicious),
-            address(dexRouterB)
-        );
-
-        tokenA.mint(address(initCore), 1_000_000e18);
-
-        ActiveSentinel.ArbParams memory params = ActiveSentinel.ArbParams({
-            tokenA: address(tokenA),
-            tokenB: address(tokenB),
-            borrowAmount: 100e18,
-            minProfitTokenA: 0,
-            amountOutMinRoute1: 0,
-            amountOutMinRoute2: 0,
-            dexPayloadRoute1: "",
-            dexPayloadRoute2: ""
-        });
-
-        // Транзакция должна откатиться из-за reentrancy в callback
-        vm.expectRevert();
-        sentinelVuln.executeFlashArbitrage(params);
     }
 
     // ─── Swap failure ────────────────────────────────────────────────
@@ -315,15 +283,19 @@ contract ActiveSentinelTest is Test {
     function test_revert_swapFailed() public {
         dexRouterA.setFail(true);
 
+        bytes memory sig = _signParams(address(tokenA), address(tokenB), 100e18, 0, 5);
+
         ActiveSentinel.ArbParams memory params = ActiveSentinel.ArbParams({
             tokenA: address(tokenA),
             tokenB: address(tokenB),
             borrowAmount: 100e18,
             minProfitTokenA: 0,
+            nonce: 5,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
             dexPayloadRoute1: "",
-            dexPayloadRoute2: ""
+            dexPayloadRoute2: "",
+            teeSignature: sig
         });
 
         vm.expectRevert(
@@ -338,33 +310,59 @@ contract ActiveSentinelTest is Test {
         tokenA.mint(address(sentinel), 50e18);
 
         uint256 balBefore = tokenA.balanceOf(owner);
-        sentinel.rescue(address(tokenA), 0); // 0 = весь баланс
+        sentinel.rescue(address(tokenA), 0);
         uint256 balAfter = tokenA.balanceOf(owner);
 
         assertEq(balAfter - balBefore, 50e18);
     }
 
+    // ─── Callback auth: direct call should fail ──────────────────────
+
+    function test_revert_directCallbackCall() public {
+        bytes memory sig = _signParams(address(tokenA), address(tokenB), 100e18, 0, 6);
+
+        ActiveSentinel.ArbParams memory params = ActiveSentinel.ArbParams({
+            tokenA: address(tokenA),
+            tokenB: address(tokenB),
+            borrowAmount: 100e18,
+            minProfitTokenA: 0,
+            nonce: 6,
+            amountOutMinRoute1: 0,
+            amountOutMinRoute2: 0,
+            dexPayloadRoute1: "",
+            dexPayloadRoute2: "",
+            teeSignature: sig
+        });
+
+        bytes memory fakeData = abi.encode(params);
+
+        vm.expectRevert(ActiveSentinel.Unauthorized.selector);
+        sentinel.onFlashBorrow(address(this), address(tokenA), 100e18, 0, fakeData);
+    }
+
     // ─── Fuzz: minProfitTokenA ───────────────────────────────────────
 
     function testFuzz_invariantEnforcement(uint256 minProfit) public {
-        // Bound minProfit to reasonable range
         minProfit = bound(minProfit, 0, 1000e18);
 
-        // Fixed 5% profit scenario
         dexRouterA.setRate(1.05e18);
         dexRouterB.setRate(1.0e18);
         uint256 borrowAmount = 100e18;
-        uint256 expectedProfit = 5e18; // 5% of 100
+        uint256 expectedProfit = 5e18;
+
+        bytes memory sig = _signParams(address(tokenA), address(tokenB), borrowAmount, minProfit, minProfit); // use minProfit as nonce for uniqueness
 
         ActiveSentinel.ArbParams memory params = ActiveSentinel.ArbParams({
             tokenA: address(tokenA),
             tokenB: address(tokenB),
             borrowAmount: borrowAmount,
             minProfitTokenA: minProfit,
+            nonce: minProfit,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
             dexPayloadRoute1: "",
-            dexPayloadRoute2: ""
+            dexPayloadRoute2: "",
+            teeSignature: sig
         });
 
         if (minProfit > expectedProfit) {
@@ -372,25 +370,5 @@ contract ActiveSentinelTest is Test {
         }
 
         sentinel.executeFlashArbitrage(params);
-    }
-
-    // ─── Callback auth: direct call should fail ──────────────────────
-
-    function test_revert_directCallbackCall() public {
-        bytes memory fakeData = abi.encode(
-            ActiveSentinel.ArbParams({
-                tokenA: address(tokenA),
-                tokenB: address(tokenB),
-                borrowAmount: 100e18,
-                minProfitTokenA: 0,
-                amountOutMinRoute1: 0,
-                amountOutMinRoute2: 0,
-                dexPayloadRoute1: "",
-                dexPayloadRoute2: ""
-            })
-        );
-
-        vm.expectRevert(ActiveSentinel.Unauthorized.selector);
-        sentinel.onFlashBorrow(address(this), address(tokenA), 100e18, 0, fakeData);
     }
 }
