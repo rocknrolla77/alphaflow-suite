@@ -1,7 +1,7 @@
 # AlphaFlow Suite — Детальное Описание Проекта
 
-> **Версия документа:** 2026-05-23  
-> **Статус:** Production-Ready MVP  
+> **Версия документа:** 2026-05-24  
+> **Статус:** Production-Ready MVP + ERC-8004 Identity  
 > **Сеть:** Mantle Network (Chain ID: 5000)  
 > **Победитель:** DoraHacks Mantle Hackathon  
 
@@ -24,7 +24,9 @@ AlphaFlow Suite — это инфраструктура автономной т�
 ```
 alphaflow-suite/
 ├── contracts/           Solidity smart contracts (Foundry)
+│   └── src/erc8004/     ERC-8004 Identity & Validation Registry
 ├── agent-tee/           AI-агент в TEE (TypeScript, Phala DStack)
+│   └── scripts/         Утилиты (generateAgentCard.ts)
 ├── bff/                 Backend-for-Frontend API (Hono, ioredis, viem)
 ├── frontend/            Telegram Mini App (React 18, Vite 5, ZeroDev SDK)
 ├── devops/              Telegram Bot + инфраструктура (Telegraf v4)
@@ -127,6 +129,10 @@ On-chain реестр репутации агентов:
 - `interfaces/IINITCore.sol` — интерфейс INIT Capital flash borrow
 - `interfaces/IFlashBorrower.sol` — callback интерфейс
 - `interfaces/IDexRouter.sol` — унифицированный интерфейс Merchant Moe + Agni Finance
+
+#### ERC-8004 контракты (`contracts/src/erc8004/`):
+- `IdentityRegistry.sol` — ERC-721 реестр идентичности AI-агентов (AgentCard URI → IPFS/Arweave)
+- `ValidationRegistry.sol` — криптографическая верификация через TEE-оракулы (SGX/TDX attestation)
 
 ### 3.3 Тесты
 - `test/ActiveSentinel.t.sol` — Foundry fuzz tests (1000 runs)
@@ -554,6 +560,134 @@ clustering tick → DynamicWatchlist.getMembers()
 
 ---
 
+## 11.5. Phase 6: ERC-8004 Agent Identity & Validation Registry
+
+### 11.5.1 Обзор Стандарта
+
+ERC-8004 — протокол on-chain идентичности для AI-агентов. Каждый агент получает ERC-721 NFT, привязанный к AgentCard (JSON) в децентрализованном хранилище (IPFS/Arweave). Стандарт обеспечивает:
+- **Программное обнаружение** (Agent-to-Agent discovery) через capabilities/endpoints
+- **Криптографическую верификацию** через независимые TEE-оракулы (Validation Hooks)
+- **Оплату за сервисы** через протокол x402 (paymentAddresses)
+
+### 11.5.2 IdentityRegistry.sol
+
+**Путь:** `contracts/src/erc8004/IdentityRegistry.sol`
+
+Реестр идентичности AI-агентов на базе ERC-721:
+- Наследует `ERC721` + `ERC721URIStorage` (OpenZeppelin)
+- Один адрес = один агент (soulbound-подобная механика)
+- tokenURI указывает на decentralized URI (ipfs://, ar://)
+- Централизованные URL (https://) нарушают Data Availability инвариант
+
+**Функции:**
+| Функция | Доступ | Описание |
+|---------|--------|----------|
+| `registerAgent(address owner, string agentCardURI)` | external | Минтинг NFT агента. Один owner = один tokenId. |
+| `updateAgentCard(uint256 tokenId, string newURI)` | owner only | Обновление URI (ротация endpoints, capabilities) |
+| `isRegistered(address account)` | view | Проверка существования агента |
+| `totalAgents()` | view | Общее количество зарегистрированных агентов |
+
+**Custom Errors:** `AgentAlreadyRegistered()`, `NotTokenOwner()`, `EmptyURI()`, `ZeroAddress()`
+
+**Event:** `AgentRegistered(uint256 indexed tokenId, address indexed owner, string agentCardURI)`
+
+### 11.5.3 ValidationRegistry.sol
+
+**Путь:** `contracts/src/erc8004/ValidationRegistry.sol`
+
+Реестр криптографической валидации агентов через TEE-оракулы:
+- Любой адрес может запросить валидацию (`requestValidation`)
+- Зарегистрированные TEE-оракулы проводят аудит и записывают результат (`submitValidation`)
+- On-chain audit trail через events + mappings
+- Attestation quote (SGX/TDX) хранится как keccak256 hash (газ-оптимизация)
+
+**Архитектура валидации:**
+```
+1. Инициатор → requestValidation(agentId, requestURI, requestHash)
+2. Event ValidationRequest эмитируется
+3. Off-chain TEE-оракулы слушают event, проводят аудит
+4. TEE-оракул → submitValidation(agentId, requestHash, isValid, attestationQuote)
+5. Результат записывается on-chain (validator → result mapping)
+```
+
+**Функции:**
+| Функция | Доступ | Описание |
+|---------|--------|----------|
+| `requestValidation(agentId, requestURI, requestHash)` | external | Запрос аудита агента |
+| `submitValidation(agentId, requestHash, isValid, attestationQuote)` | onlyValidator | Запись результата TEE-оракула |
+| `addValidator(address)` | onlyOwner | Регистрация TEE-оракула |
+| `removeValidator(address)` | onlyOwner | Удаление валидатора |
+| `getApprovalRate(requestHash)` | view | Процент положительных валидаций |
+| `getAgentRequests(agentId)` | view | Все запросы для агента |
+
+**Events:**
+- `ValidationRequest(address indexed requester, uint256 indexed agentId, string requestURI, bytes32 indexed requestHash)`
+- `ValidationSubmitted(address indexed validator, uint256 indexed agentId, bytes32 indexed requestHash, bool isValid, bytes32 attestationHash)`
+
+**Trust Model:**
+- Валидаторы регистрируются owner (deployer)
+- Один валидатор = один ответ на request (no double-submit)
+- attestationQuote верифицируется off-chain через Intel/AMD attestation service
+
+### 11.5.4 AgentCard JSON Generator
+
+**Путь:** `agent-tee/scripts/generateAgentCard.ts`
+
+TypeScript скрипт для генерации AgentCard JSON по стандарту ERC-8004:
+
+**Обязательные поля (ERC-8004 compliance):**
+```json
+{
+  "schemaVersion": "1.0.0",
+  "name": "AlphaFlow Sentinel",
+  "description": "Autonomous flash-arbitrage agent on Mantle Network...",
+  "capabilities": ["MCP", "flash-arbitrage", "cross-dex-monitoring", "tee-execution", ...],
+  "endpoints": {
+    "mcp": "https://alphaflow-sentinel.phala.network/mcp",
+    "health": "https://alphaflow-sentinel.phala.network/health",
+    "ws": "wss://alphaflow-sentinel.phala.network/ws",
+    "rest": "https://alphaflow-sentinel.phala.network/api/v1"
+  },
+  "paymentAddresses": {
+    "mantle": "0x...",
+    "ethereum": "0x..."
+  },
+  "tee": {
+    "type": "TDX",
+    "attestationEndpoint": "https://alphaflow-sentinel.phala.network/attestation"
+  }
+}
+```
+
+**Валидация:**
+- `capabilities` ОБЯЗАН содержать "MCP" (Model Context Protocol)
+- `endpoints.mcp` обязателен
+- `paymentAddresses` — минимум одна запись, формат 0x + 40 hex chars
+- Пустые name/description → ошибка валидации
+
+**Использование:**
+```bash
+# Генерация JSON
+npx tsx agent-tee/scripts/generateAgentCard.ts --output ./agent-card.json
+
+# Генерация + загрузка на IPFS (Pinata)
+PINATA_JWT=<jwt> npx tsx agent-tee/scripts/generateAgentCard.ts --upload
+```
+
+**Выход `--upload`:** CID файла на IPFS → используется как agentCardURI в IdentityRegistry.registerAgent()
+
+### 11.5.5 Риски и Митигации
+
+| Риск | Описание | Митигация |
+|------|----------|-----------|
+| Data Availability | AgentCard на централизованном сервере → single point of failure | agentCardURI ДОЛЖЕН быть ipfs:// или ar://. Filecoin Pin для persistence. |
+| Несовместимость метаданных | Отсутствие capabilities/endpoints → Agent-to-Agent невозможен | Строгая JSON-валидация в generateAgentCard.ts, custom errors. |
+| Sybil Attack | Множественная регистрация агентов | Один адрес = один агент (agentOf mapping). |
+| Stale AgentCard | Endpoints устарели после ротации | updateAgentCard() + event для off-chain indexers. |
+| Malicious Validator | Ложные результаты валидации | Multiple validators + approval rate threshold. |
+
+---
+
 ## 12. Переменные Окружения
 
 ### Agent TEE
@@ -667,8 +801,13 @@ cd bff && npm test
 - Phase 4: Dynamic Watchlist + Clustering Engine
 - Phase 5: RWA Asset Registry
 
+### ✅ Phase 6: ERC-8004 Agent Identity & Validation
+- IdentityRegistry.sol — on-chain реестр идентичности агентов (ERC-721 + URIStorage)
+- ValidationRegistry.sol — криптографическая верификация через TEE-оракулы
+- generateAgentCard.ts — генератор ERC-8004 AgentCard JSON (IPFS upload)
+
 ### 🔜 Next
-- Circuit Breaker pattern (automatic halt при anomalиях)
+- Circuit Breaker pattern (automatic halt при аномалиях)
 - Formal Verification (Certora / Halmos)
 - Multi-path Arbitrage (3+ hop routes)
 - Cross-DEX aggregation (более 2 DEX одновременно)
