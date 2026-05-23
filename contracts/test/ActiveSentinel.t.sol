@@ -162,12 +162,13 @@ contract ActiveSentinelTest is Test {
         uint256 nonce
     ) internal view returns (bytes memory) {
         bytes32 structHash = keccak256(abi.encode(
-            keccak256("ArbParams(address tokenA,address tokenB,uint256 borrowAmount,uint256 minProfitTokenA,uint256 nonce)"),
+            keccak256("ArbParams(address tokenA,address tokenB,uint256 borrowAmount,uint256 minProfitTokenA,uint256 nonce,bytes32 reasoningHash)"),
             _tokenA,
             _tokenB,
             borrowAmount,
             minProfit,
-            nonce
+            nonce,
+            bytes32(0)
         ));
         bytes32 domainSeparator = sentinel.domainSeparator();
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
@@ -191,6 +192,7 @@ contract ActiveSentinelTest is Test {
             nonce: 1,
             amountOutMinRoute1: 100e18,
             amountOutMinRoute2: 100e18,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -218,6 +220,7 @@ contract ActiveSentinelTest is Test {
             nonce: 2,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -246,6 +249,7 @@ contract ActiveSentinelTest is Test {
             nonce: 3,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -269,6 +273,7 @@ contract ActiveSentinelTest is Test {
             nonce: 4,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -293,6 +298,7 @@ contract ActiveSentinelTest is Test {
             nonce: 5,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -329,6 +335,7 @@ contract ActiveSentinelTest is Test {
             nonce: 6,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -360,6 +367,7 @@ contract ActiveSentinelTest is Test {
             nonce: minProfit,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig

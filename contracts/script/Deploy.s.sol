@@ -134,7 +134,7 @@ contract DeployActiveSentinel is Script {
         // ═══════════════════════════════════════════════════════════════════
         console2.log("");
         console2.log("====================================================");
-        console2.log("  ALPHAFLOW SUITE — DEPLOYMENT SUMMARY (Phase 3)");
+        console2.log("  ALPHAFLOW SUITE - DEPLOYMENT SUMMARY (Phase 3)");
         console2.log("====================================================");
         console2.log("  [ERC-8004]");
         console2.log("    IdentityRegistry:    ", address(identityReg));

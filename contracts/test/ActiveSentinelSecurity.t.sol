@@ -167,6 +167,7 @@ contract MaliciousDexRouter is IDexRouter {
                 nonce: 999999,
                 amountOutMinRoute1: 0,
                 amountOutMinRoute2: 0,
+                reasoningHash: bytes32(0),
                 dexPayloadRoute1: "",
                 dexPayloadRoute2: "",
                 teeSignature: ""
@@ -222,6 +223,7 @@ contract MaliciousERC777Token is IERC20 {
                 nonce: 888888,
                 amountOutMinRoute1: 0,
                 amountOutMinRoute2: 0,
+                reasoningHash: bytes32(0),
                 dexPayloadRoute1: "",
                 dexPayloadRoute2: "",
                 teeSignature: ""
@@ -317,12 +319,13 @@ contract ActiveSentinelSecurityTest is Test {
         uint256 nonce
     ) internal view returns (bytes memory) {
         bytes32 structHash = keccak256(abi.encode(
-            keccak256("ArbParams(address tokenA,address tokenB,uint256 borrowAmount,uint256 minProfitTokenA,uint256 nonce)"),
+            keccak256("ArbParams(address tokenA,address tokenB,uint256 borrowAmount,uint256 minProfitTokenA,uint256 nonce,bytes32 reasoningHash)"),
             _tokenA,
             _tokenB,
             borrowAmount,
             minProfit,
-            nonce
+            nonce,
+            bytes32(0)
         ));
 
         bytes32 domainSeparator = sentinel.domainSeparator();
@@ -350,6 +353,7 @@ contract ActiveSentinelSecurityTest is Test {
             nonce: nonce,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -436,6 +440,7 @@ contract ActiveSentinelSecurityTest is Test {
             nonce: 10,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: attackerSig
@@ -455,6 +460,7 @@ contract ActiveSentinelSecurityTest is Test {
             nonce: 11,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: ""  // пустая подпись
@@ -485,6 +491,7 @@ contract ActiveSentinelSecurityTest is Test {
             nonce: 12,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -552,6 +559,7 @@ contract ActiveSentinelSecurityTest is Test {
             nonce: 30,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -596,6 +604,7 @@ contract ActiveSentinelSecurityTest is Test {
             nonce: 40,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: ""
@@ -647,6 +656,7 @@ contract ActiveSentinelSecurityTest is Test {
             nonce: 50,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -673,6 +683,7 @@ contract ActiveSentinelSecurityTest is Test {
             nonce: 51,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -699,6 +710,7 @@ contract ActiveSentinelSecurityTest is Test {
             nonce: 52,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -786,7 +798,9 @@ contract ActiveSentinelSecurityTest is Test {
             address(tokenA),
             address(tokenB),
             100e18,
-            5e18  // 5% profit
+            5e18,  // 5% profit
+            bytes32(0),
+            0
         );
 
         sentinel.executeFlashArbitrage(params);
@@ -811,6 +825,7 @@ contract ActiveSentinelSecurityTest is Test {
             nonce: nonce,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: sig
@@ -849,6 +864,7 @@ contract ActiveSentinelSecurityTest is Test {
             nonce: 80,
             amountOutMinRoute1: 0,
             amountOutMinRoute2: 0,
+            reasoningHash: bytes32(0),
             dexPayloadRoute1: "",
             dexPayloadRoute2: "",
             teeSignature: oldSig

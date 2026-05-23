@@ -8,6 +8,7 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {IINITCore} from "./interfaces/IINITCore.sol";
 import {IFlashBorrower} from "./interfaces/IFlashBorrower.sol";
 import {IDexRouter} from "./interfaces/IDexRouter.sol";
+import {IdentityRegistry} from "./erc8004/IdentityRegistry.sol";
 
 /// @title ActiveSentinel — Core Execution Engine (Hardened)
 /// @notice Атомарный флеш-арбитраж на Mantle Network с гибридной защитой и криптографической валидацией
@@ -28,6 +29,12 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
     /// @notice Авторизованный TEE-агент (подписывает EIP-712 квитанции)
     address public authorizedTeeAgent;
 
+    /// @notice ERC-8004 IdentityRegistry (для разрешения agentId)
+    IdentityRegistry public identityRegistry;
+
+    /// @notice Agent ID (ERC-8004 tokenId) данного TEE-агента
+    uint256 public agentId;
+
     /// @dev Гибридный замок: SSTORE (газовый барьер для low-gas субконтекстов)
     /// Значение 1 = unlocked, 2 = locked
     uint256 private _reentrancyStatus = 1;
@@ -38,7 +45,7 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
 
     /// @dev EIP-712 typehash для ArbParams
     bytes32 private constant ARB_TYPEHASH = keccak256(
-        "ArbParams(address tokenA,address tokenB,uint256 borrowAmount,uint256 minProfitTokenA,uint256 nonce)"
+        "ArbParams(address tokenA,address tokenB,uint256 borrowAmount,uint256 minProfitTokenA,uint256 nonce,bytes32 reasoningHash)"
     );
 
     // Magic return value для callback подтверждения
@@ -73,11 +80,14 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
         address indexed tokenA,
         address indexed tokenB,
         uint256 borrowAmount,
-        uint256 profit
+        uint256 profit,
+        bytes32 reasoningHash,
+        uint256 indexed agentId
     );
 
     event TeeAgentUpdated(address indexed oldAgent, address indexed newAgent);
     event TokenWhitelistUpdated(address indexed token, bool status);
+    event IdentityRegistryUpdated(address indexed registry, uint256 agentId);
 
     // ═══════════════════════════════════════════════════════════════════
     //                          STRUCTS
@@ -91,6 +101,7 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
         uint256 nonce;           // Replay protection nonce
         uint256 amountOutMinRoute1; // Slippage protection: route 1 (A -> B)
         uint256 amountOutMinRoute2; // Slippage protection: route 2 (B -> A)
+        bytes32 reasoningHash;   // keccak256 хэш off-chain reasoning (ERC-8004 transparency)
         bytes dexPayloadRoute1;  // Merchant Moe: swap tokenA -> tokenB
         bytes dexPayloadRoute2;  // Agni Finance: swap tokenB -> tokenA
         bytes teeSignature;      // EIP-712 подпись от авторизованного TEE-агента
@@ -203,7 +214,9 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
             params.tokenA,
             params.tokenB,
             params.borrowAmount,
-            actualProfit
+            actualProfit,
+            params.reasoningHash,
+            agentId
         );
     }
 
@@ -308,6 +321,26 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
         require(success, "Native transfer failed");
     }
 
+    /// @notice Установить IdentityRegistry и привязать Agent ID
+    /// @param _registry Адрес IdentityRegistry (ERC-8004)
+    /// @dev agentId автоматически разрешается через agentOf[authorizedTeeAgent]
+    function setIdentityRegistry(address _registry) external onlyOwner {
+        if (_registry == address(0)) revert ZeroAddress();
+        identityRegistry = IdentityRegistry(_registry);
+        uint256 _agentId = identityRegistry.agentOf(authorizedTeeAgent);
+        require(_agentId != 0, "TEE agent not registered in IdentityRegistry");
+        agentId = _agentId;
+        emit IdentityRegistryUpdated(_registry, _agentId);
+    }
+
+    /// @notice Установить ValidationRegistry (для совместимости с Deploy script)
+    /// @param _registry Адрес ValidationRegistry
+    function setValidationRegistry(address _registry) external onlyOwner {
+        if (_registry == address(0)) revert ZeroAddress();
+        // Store as generic — ValidationRegistry is referenced off-chain
+        // No on-chain interaction needed from ActiveSentinel
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     //                      INTERNAL FUNCTIONS
     // ═══════════════════════════════════════════════════════════════════
@@ -321,7 +354,8 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
             params.tokenB,
             params.borrowAmount,
             params.minProfitTokenA,
-            params.nonce
+            params.nonce,
+            params.reasoningHash
         ));
         bytes32 digest = _hashTypedDataV4(structHash);
         address recovered = ECDSA.recover(digest, params.teeSignature);
