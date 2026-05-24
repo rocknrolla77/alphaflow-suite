@@ -24,9 +24,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import "dotenv/config";
-import { Telegraf, Markup, Context } from "telegraf";
-import type { CallbackQuery } from "telegraf/types";
-import { randomBytes } from "node:crypto";
+import { Telegraf, Markup } from "telegraf";
+import type { Context, CallbackQuery } from "telegraf/types";
 import {
     getSubscriber,
     getCommander,
@@ -76,20 +75,7 @@ const bot = new Telegraf(BOT_TOKEN);
 bot.use(async (ctx: Context, next) => {
     const chatId = ctx.chat?.id;
 
-    // Allow /start and /demo from ANY user (Zero-Friction UX for judges)
-    if (ctx.message && "text" in ctx.message) {
-        const text = ctx.message.text;
-        if (/^\/(start|demo)/.test(text)) {
-            return next();
-        }
-    }
-
-    // Allow callback_query (vote buttons) from anyone
-    if (ctx.callbackQuery) {
-        return next();
-    }
-
-    // Admin commands (/status, /pause, /resume) — only TARGET_CHAT_ID
+    // callback_query не содержит ctx.chat, проверяем через message
     if (chatId !== undefined && chatId !== TARGET_CHAT_ID) {
         console.warn(
             `[Bot] Ignored message from unauthorized chat: ${chatId}`
@@ -105,121 +91,12 @@ bot.use(async (ctx: Context, next) => {
 bot.start(async (ctx) => {
     await ctx.reply(
         "⚡ *AlphaFlow Suite* — Agentic Commerce Infrastructure\n\n" +
-        "TEE-агент анализирует рынок и генерирует торговые сигналы.\n" +
-        "Вы подтверждаете исполнение через Passkey (WebAuthn) — без seed-фраз.\n\n" +
-        "*Команды:*\n" +
-        "• /demo   — 🚀 Сгенерировать тестовый RWA-сигнал\n" +
-        "• /status — Состояние системы\n" +
-        "• /help   — Справка",
+        "Бот активен. Ожидаю сигналы от TEE-агента.\n\n" +
+        "*Команды управления:*\n" +
+        "• /status — состояние Redis и статистика\n" +
+        "• /pause  — приостановить приём сигналов\n" +
+        "• /resume — возобновить приём сигналов",
         { parse_mode: "Markdown" }
-    );
-});
-
-// ─── /demo Command — Self-Serve Trigger ──────────────────────────────────────
-//
-// Zero-Friction UX: любой пользователь (судья хакатона) может запустить
-// полный demo-flow без серверного curl.
-//
-// АРХИТЕКТУРА: мы формируем валидный TeeProposal mock и прогоняем его через
-// тот же storeProposal() pipeline → Redis + HMAC. BFF получает proposal
-// с реальной подписью, никакого bypass не требуется.
-
-bot.command("demo", async (ctx) => {
-    const chatId = ctx.chat.id;
-    await ctx.sendChatAction("typing");
-
-    // ─── Generate demo TeeProposal (valid schema) ─────────────────────────
-    const now = Math.floor(Date.now() / 1000);
-    const deadline = now + 300; // 5 minutes
-    const reasoningHash = `0x${randomBytes(32).toString("hex")}`;
-    // Mock signature (65 bytes = 130 hex chars)
-    const mockSignature = `0x${randomBytes(65).toString("hex")}`;
-    // Mock signer address
-    const mockSigner = "0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18";
-
-    const demoProposal = {
-        asset: "0xA9b21CFDa40a1a4B3285580E1e8f20b5d2f03Dc5", // demo USDY-like
-        assetSymbol: "USDY",
-        action: "BUY" as const,
-        recommendedAmount: "1500000000000000000000", // 1500 tokens
-        nonce: Math.floor(Math.random() * 1_000_000),
-        deadline,
-        reasoningHash,
-        signature: mockSignature,
-        signerAddress: mockSigner,
-        generatedAt: now,
-        maxSlippageBps: 150, // 1.5%
-    };
-
-    // ─── Store via existing pipeline (generates UUID + HMAC) ──────────────
-    const raw = JSON.stringify(demoProposal);
-    const result = await storeProposal(raw);
-
-    if (!result) {
-        await ctx.reply(
-            "⚠️ *Ошибка:* не удалось создать demo-proposal.\n" +
-            "Проверьте: бот не на паузе (/resume), Redis доступен (/status).",
-            { parse_mode: "Markdown" }
-        );
-        return;
-    }
-
-    // ─── Format alert message ────────────────────────────────────────────
-    const amountEth = (Number(BigInt(demoProposal.recommendedAmount)) / 1e18).toLocaleString("en-US", {
-        maximumFractionDigits: 2,
-    });
-
-    const reasoningShort =
-        reasoningHash.slice(0, 12) + "..." + reasoningHash.slice(-8);
-
-    const message =
-        `⚡ *AlphaFlow TEE Signal* (DEMO)\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `🟢 *Action:*   \`LONG / BUY\`\n` +
-        `💎 *Asset:*    \`${demoProposal.assetSymbol}\` (RWA Yield Token)\n` +
-        `💰 *Volume:*   \`${amountEth} tokens\`\n` +
-        `🛡 *Slippage:* \`1.5%\`\n` +
-        `⏱ *Expires:*  \`5m 0s\`\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `🔐 *Proof-of-Reasoning:*\n` +
-        `\`${reasoningShort}\`\n\n` +
-        `_Signed by TEE Signer: ${mockSigner.slice(0, 12)}..._\n\n` +
-        `_Нажмите кнопку ниже для исполнения через Passkey:_`;
-
-    // ─── Deep link with valid HMAC ──────────────────────────────────────
-    const startappParam = `${result.proposalId}_${result.hmacB64url}`;
-    const webAppUrl     = `https://t.me/${BOT_USERNAME}/app?startapp=${startappParam}`;
-
-    // ─── Inline Keyboard ────────────────────────────────────────────────
-    const agentIdStr = DEFAULT_AGENT_ID.toString();
-    const keyboard = Markup.inlineKeyboard([
-        [
-            Markup.button.webApp(
-                "⚡ Execute via Passkey",
-                webAppUrl
-            ),
-        ],
-        [
-            Markup.button.callback(
-                "👍 Хорошая стратегия",
-                `vote_up_${result.proposalId}_${agentIdStr}`
-            ),
-            Markup.button.callback(
-                "👎 Сомнительная",
-                `vote_down_${result.proposalId}_${agentIdStr}`
-            ),
-        ],
-    ]);
-
-    // ─── Send to the requesting user (not just TARGET_CHAT_ID) ──────────
-    await bot.telegram.sendMessage(chatId, message, {
-        parse_mode: "Markdown",
-        ...keyboard,
-    });
-
-    console.log(
-        `[Bot] Demo proposal sent to chat ${chatId} | ` +
-        `ProposalId=${result.proposalId} | TTL=${result.ttlSeconds}s`
     );
 });
 
@@ -278,8 +155,7 @@ bot.command("resume", async (ctx) => {
 bot.help(async (ctx) => {
     await ctx.reply(
         "*AlphaFlow Bot Commands:*\n\n" +
-        "/start  — Приветствие и описание системы\n" +
-        "/demo   — 🚀 Сгенерировать тестовый сигнал (самообслуживание)\n" +
+        "/start  — Приветствие и список команд\n" +
         "/status — Статус Redis и статистика сигналов\n" +
         "/pause  — Приостановить приём TEE-сигналов\n" +
         "/resume — Возобновить приём TEE-сигналов",
