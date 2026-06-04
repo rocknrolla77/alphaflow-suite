@@ -47,13 +47,12 @@ contract DeployMainnet is Script {
         ActiveSentinel sentinel = new ActiveSentinel(
             INIT_CORE,
             DEX_ROUTER_A,
-            DEX_ROUTER_B,
-            teeAgent
+            DEX_ROUTER_B
         );
         console2.log("[4/5] ActiveSentinel:", address(sentinel));
 
         // 5. Link Identity Registry
-        sentinel.setIdentityRegistry(address(identity));
+        sentinel.setIdentityRegistry(address(identity), agentTokenId);
         console2.log("[5/5] setIdentityRegistry done");
 
         vm.stopBroadcast();

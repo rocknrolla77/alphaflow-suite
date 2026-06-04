@@ -69,10 +69,10 @@ contract DeployActiveSentinel is Script {
         // ═══════════════════════════════════════════════════════════════════
         //  STEP 3: ActiveSentinel (Core Execution Engine)
         // ═══════════════════════════════════════════════════════════════════
-        ActiveSentinel sentinel = new ActiveSentinel(initCore, dexA, dexB, teeAgent);
+        ActiveSentinel sentinel = new ActiveSentinel(initCore, dexA, dexB);
         console2.log("[3/6] ActiveSentinel deployed at:", address(sentinel));
         console2.log("       Owner:", sentinel.owner());
-        console2.log("       TEE Agent:", sentinel.authorizedTeeAgent());
+        console2.log("       TrustedDispatcher: (to be set)");
 
         // ═══════════════════════════════════════════════════════════════════
         //  STEP 4: SentinelIdentity (Legacy ERC-721 — Agent Tokens)
@@ -113,19 +113,16 @@ contract DeployActiveSentinel is Script {
         // 3. Inject ERC-8004 registry addresses into ActiveSentinel
         //    NOTE: ActiveSentinel must expose setIdentityRegistry/setValidationRegistry
         //    If not available, addresses are logged for manual configuration
-        try sentinel.setIdentityRegistry(address(identityReg)) {
+        // Set IdentityRegistry with agentId = 1 (first registered agent)
+        try sentinel.setIdentityRegistry(address(identityReg), 1) {
             console2.log("  ActiveSentinel.setIdentityRegistry:", address(identityReg));
         } catch {
             console2.log("  [WARN] ActiveSentinel.setIdentityRegistry not available");
             console2.log("         Manual config required:", address(identityReg));
         }
 
-        try sentinel.setValidationRegistry(address(validationReg)) {
-            console2.log("  ActiveSentinel.setValidationRegistry:", address(validationReg));
-        } catch {
-            console2.log("  [WARN] ActiveSentinel.setValidationRegistry not available");
-            console2.log("         Manual config required:", address(validationReg));
-        }
+        // ValidationRegistry is now external to ActiveSentinel
+        console2.log("  ValidationRegistry:", address(validationReg));
 
         vm.stopBroadcast();
 

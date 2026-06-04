@@ -3,18 +3,18 @@ pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
-import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {IINITCore} from "./interfaces/IINITCore.sol";
 import {IFlashBorrower} from "./interfaces/IFlashBorrower.sol";
 import {IDexRouter} from "./interfaces/IDexRouter.sol";
 import {IdentityRegistry} from "./erc8004/IdentityRegistry.sol";
 
-/// @title ActiveSentinel — Core Execution Engine (Hardened)
-/// @notice Атомарный флеш-арбитраж на Mantle Network с гибридной защитой и криптографической валидацией
-/// @dev Phase 2: Context Validation (H-08), Hybrid Reentrancy Guard, Token Whitelist
+/// @title ActiveSentinel — Core Execution Engine (Swarm Mode)
+/// @notice Атомарный флеш-арбитраж на Mantle Network с гибридной защитой.
+/// @dev Phase 3: Swarm Architecture — TEE-подпись верифицируется MicroFundingDispatcher,
+///      а ActiveSentinel доверяет вызовам от trustedDispatcher или зарегистрированных ERC-8004 агентов.
+///      EIP-712 логика удалена из контракта (делегирована Диспетчеру).
 /// @custom:security-contact security@alphaflow.xyz
-contract ActiveSentinel is EIP712, IFlashBorrower {
+contract ActiveSentinel is IFlashBorrower {
     using SafeERC20 for IERC20;
 
     // ═══════════════════════════════════════════════════════════════════
@@ -26,8 +26,9 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
     address public immutable dexRouterA; // Merchant Moe
     address public immutable dexRouterB; // Agni Finance
 
-    /// @notice Авторизованный TEE-агент (подписывает EIP-712 квитанции)
-    address public authorizedTeeAgent;
+    /// @notice Авторизованный Dispatcher (MicroFundingDispatcher)
+    /// @dev Вызовы от этого адреса считаются верифицированными TEE-подписями
+    address public trustedDispatcher;
 
     /// @notice ERC-8004 IdentityRegistry (для разрешения agentId)
     IdentityRegistry public identityRegistry;
@@ -42,11 +43,6 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
     /// @dev Слот для TSTORE (быстрая проверка, газ-оптимизация)
     /// keccak256("sentinel.reentrancy.lock") - 1
     bytes32 private constant TSTORE_LOCK_SLOT = 0x8b1a944cf13a9a1c08facb1f3de33a0e0c40e06ee15c5e8a12ef28645c0d69a5;
-
-    /// @dev EIP-712 typehash для ArbParams
-    bytes32 private constant ARB_TYPEHASH = keccak256(
-        "ArbParams(address tokenA,address tokenB,uint256 borrowAmount,uint256 minProfitTokenA,uint256 nonce,bytes32 reasoningHash)"
-    );
 
     // Magic return value для callback подтверждения
     bytes32 private constant CALLBACK_SUCCESS = keccak256("IFlashBorrower.onFlashBorrow");
@@ -67,7 +63,6 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
     error SwapFailed(uint8 routeIndex);
     error ZeroAmount();
     error InvalidInitiator();
-    error InvalidTEESignature();
     error UnapprovedToken();
     error NonceAlreadyUsed();
     error ZeroAddress();
@@ -85,7 +80,7 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
         uint256 indexed agentId
     );
 
-    event TeeAgentUpdated(address indexed oldAgent, address indexed newAgent);
+    event TrustedDispatcherUpdated(address indexed oldDispatcher, address indexed newDispatcher);
     event TokenWhitelistUpdated(address indexed token, bool status);
     event IdentityRegistryUpdated(address indexed registry, uint256 agentId);
 
@@ -104,7 +99,6 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
         bytes32 reasoningHash;   // keccak256 хэш off-chain reasoning (ERC-8004 transparency)
         bytes dexPayloadRoute1;  // Merchant Moe: swap tokenA -> tokenB
         bytes dexPayloadRoute2;  // Agni Finance: swap tokenB -> tokenA
-        bytes teeSignature;      // EIP-712 подпись от авторизованного TEE-агента
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -114,17 +108,15 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
     constructor(
         address _initCore,
         address _dexRouterA,
-        address _dexRouterB,
-        address _teeAgent
-    ) EIP712("AlphaFlow_ActiveSentinel", "2") {
+        address _dexRouterB
+    ) {
         if (_initCore == address(0) || _dexRouterA == address(0) 
-            || _dexRouterB == address(0) || _teeAgent == address(0)) revert ZeroAddress();
+            || _dexRouterB == address(0)) revert ZeroAddress();
         
         owner = msg.sender;
         initCore = _initCore;
         dexRouterA = _dexRouterA;
         dexRouterB = _dexRouterB;
-        authorizedTeeAgent = _teeAgent;
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -165,14 +157,24 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
         _;
     }
 
+    /// @dev Разрешаем вызов от trustedDispatcher ИЛИ от зарегистрированных ERC-8004 агентов
+    modifier onlyAuthorizedCaller() {
+        if (msg.sender != trustedDispatcher && 
+            (address(identityRegistry) == address(0) || identityRegistry.balanceOf(msg.sender) == 0)) {
+            revert Unauthorized();
+        }
+        _;
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     //                      EXTERNAL FUNCTIONS
     // ═══════════════════════════════════════════════════════════════════
 
-    /// @notice Точка входа для арбитражной операции
-    /// @dev Вызывается owner (EOA или ZeroDev Kernel account через Session Key)
-    /// @param params Параметры арбитража, рассчитанные и подписанные TEE-агентом
-    function executeFlashArbitrage(ArbParams calldata params) external onlyOwner hybridReentrancyGuard {
+    /// @notice Точка входа для арбитражной операции (Swarm Mode)
+    /// @dev Вызывается MicroFundingDispatcher (TEE-подпись уже верифицирована)
+    ///      или напрямую зарегистрированным ERC-8004 агентом (Byreal wallet)
+    /// @param params Параметры арбитража, рассчитанные TEE-агентом
+    function executeFlashArbitrage(ArbParams calldata params) external onlyAuthorizedCaller hybridReentrancyGuard {
         // CHECKS: Token whitelist
         if (!isWhitelistedToken[params.tokenA]) revert UnapprovedToken();
         if (!isWhitelistedToken[params.tokenB]) revert UnapprovedToken();
@@ -185,9 +187,6 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
 
         // EFFECTS: Consume nonce
         usedNonces[params.nonce] = true;
-
-        // CHECKS: TEE Agent EIP-712 signature verification
-        _verifyTeeSignature(params);
 
         uint256 balanceBefore = IERC20(params.tokenA).balanceOf(address(this));
 
@@ -276,13 +275,13 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
     //                      ADMIN FUNCTIONS
     // ═══════════════════════════════════════════════════════════════════
 
-    /// @notice Обновить авторизованный TEE-агент
-    /// @param _newAgent Адрес нового TEE-агента
-    function setTeeAgent(address _newAgent) external onlyOwner {
-        if (_newAgent == address(0)) revert ZeroAddress();
-        address oldAgent = authorizedTeeAgent;
-        authorizedTeeAgent = _newAgent;
-        emit TeeAgentUpdated(oldAgent, _newAgent);
+    /// @notice Установить доверенный MicroFundingDispatcher
+    /// @param _dispatcher Адрес Dispatcher контракта
+    function setTrustedDispatcher(address _dispatcher) external onlyOwner {
+        if (_dispatcher == address(0)) revert ZeroAddress();
+        address oldDispatcher = trustedDispatcher;
+        trustedDispatcher = _dispatcher;
+        emit TrustedDispatcherUpdated(oldDispatcher, _dispatcher);
     }
 
     /// @notice Управление белым списком токенов
@@ -323,48 +322,25 @@ contract ActiveSentinel is EIP712, IFlashBorrower {
 
     /// @notice Установить IdentityRegistry и привязать Agent ID
     /// @param _registry Адрес IdentityRegistry (ERC-8004)
-    /// @dev agentId автоматически разрешается через agentOf[authorizedTeeAgent]
-    function setIdentityRegistry(address _registry) external onlyOwner {
+    /// @param _agentId Agent tokenId (из SentinelIdentity)
+    function setIdentityRegistry(address _registry, uint256 _agentId) external onlyOwner {
         if (_registry == address(0)) revert ZeroAddress();
         identityRegistry = IdentityRegistry(_registry);
-        uint256 _agentId = identityRegistry.agentOf(authorizedTeeAgent);
-        require(_agentId != 0, "TEE agent not registered in IdentityRegistry");
         agentId = _agentId;
         emit IdentityRegistryUpdated(_registry, _agentId);
     }
 
-    /// @notice Установить ValidationRegistry (для совместимости с Deploy script)
-    /// @param _registry Адрес ValidationRegistry
-    function setValidationRegistry(address _registry) external onlyOwner {
-        if (_registry == address(0)) revert ZeroAddress();
-        // Store as generic — ValidationRegistry is referenced off-chain
-        // No on-chain interaction needed from ActiveSentinel
-    }
-
     // ═══════════════════════════════════════════════════════════════════
-    //                      INTERNAL FUNCTIONS
+    //                      VIEW FUNCTIONS
     // ═══════════════════════════════════════════════════════════════════
 
-    /// @dev Верификация EIP-712 подписи TEE-агента
-    /// @param params Параметры арбитража с подписью
-    function _verifyTeeSignature(ArbParams calldata params) internal view {
-        bytes32 structHash = keccak256(abi.encode(
-            ARB_TYPEHASH,
-            params.tokenA,
-            params.tokenB,
-            params.borrowAmount,
-            params.minProfitTokenA,
-            params.nonce,
-            params.reasoningHash
-        ));
-        bytes32 digest = _hashTypedDataV4(structHash);
-        address recovered = ECDSA.recover(digest, params.teeSignature);
-        if (recovered != authorizedTeeAgent) revert InvalidTEESignature();
-    }
-
-    /// @notice Возвращает EIP-712 domain separator (для off-chain верификации)
-    function domainSeparator() external view returns (bytes32) {
-        return _domainSeparatorV4();
+    /// @notice Проверяет, является ли вызывающий авторизованным
+    /// @param caller Проверяемый адрес
+    /// @return true если caller — dispatcher или зарегистрированный агент
+    function isAuthorizedCaller(address caller) external view returns (bool) {
+        if (caller == trustedDispatcher) return true;
+        if (address(identityRegistry) != address(0) && identityRegistry.balanceOf(caller) > 0) return true;
+        return false;
     }
 
     receive() external payable {}
