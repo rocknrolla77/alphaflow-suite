@@ -1,275 +1,393 @@
-// Файл: agent-tee/src/test/yieldArchitect.test.ts
-// Unit tests для Yield Architect Strategy Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+// AlphaFlow Suite — agent-tee/src/test/yieldArchitect.test.ts
+// Unit tests для Yield Architect Strategy Engine (Phase 5 — Swarm Mode)
+//
+// Тестируем:
+// 1. Volume calculation (Smart Money Weight formula)
+// 2. Bounds checking / input validation
+// 3. Legacy EIP-712 Proposal подпись (Proof-of-Reasoning)
+// 4. NEW: ForwardRequest EIP-712 подпись для MicroFundingDispatcher
+// 5. NEW: Подпись recoverTypedDataAddress через viem
+// ═══════════════════════════════════════════════════════════════════════════════
 
 import { describe, it, expect, beforeEach } from "vitest";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { verifyTypedData } from "viem";
-import { YieldArchitect } from "../strategies/yieldArchitect";
-import { NansenMCPClient } from "../services/nansenClient";
-import type { SmartMoneySignal, UserRiskProfile } from "../types";
+import { verifyTypedData, parseEther, type Address, type Hex } from "viem";
+import { YieldArchitect, type ArbParams } from "../strategies/yieldArchitect.js";
+import type { SmartMoneySignal, UserRiskProfile, ForwardRequest } from "../types/index.js";
+import { DISPATCHER_EIP712_DOMAIN, FORWARD_REQUEST_TYPES } from "../types/index.js";
 
-// ═══════════════════════════════════════════════════════════════════════
-//                       MOCK NANSEN CLIENT
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+//                          TEST FIXTURES
+// ═══════════════════════════════════════════════════════════════════════════════
 
-class MockNansenClient extends NansenMCPClient {
-    constructor() {
-        super({
-            apiUrl: "http://mock.nansen.local",
-            apiKey: "test-key",
-            chain: "mantle",
-            timeoutMs: 5000,
-            maxRetries: 0,
-        });
-    }
+const ACTIVE_SENTINEL_ADDRESS = "0x1234567890123456789012345678901234567890" as Address;
 
-    // Override для тестов — не делает реальных HTTP запросов
-    async getSmartMoneyWallets() {
-        return [
-            {
-                address: "0x1111111111111111111111111111111111111111" as `0x${string}`,
-                tags: ["Fund" as const],
-                totalValueUsd: 50_000_000,
-                recentTxs: [],
-            },
-        ];
-    }
-
-    async getRecentTransactions() {
-        return [
-            {
-                hash: "0xabc123" as `0x${string}`,
-                timestamp: Math.floor(Date.now() / 1000) - 300,
-                tokenAddress: "0x2222222222222222222222222222222222222222" as `0x${string}`,
-                tokenSymbol: "WMNT",
-                action: "BUY" as const,
-                amountUsd: 500_000,
-                chain: "mantle",
-            },
-        ];
-    }
+function createDefaultSignal(): SmartMoneySignal {
+    return {
+        walletAddress: "0x28C6c06298d514Db089934071355E5743bf21d60",
+        walletTag: "Fund",
+        reputationScore: 0.92,
+        asset: "0x78c1b0C915c4FAA5FffA6CAbf0219DA63d7f4cb8",
+        assetSymbol: "WMNT",
+        action: "BUY",
+        tradeVolume: parseEther("500000"),      // 500k tokens
+        totalPortfolioValue: parseEther("10000000"), // 10M total portfolio
+        detectedAt: Math.floor(Date.now() / 1000),
+        sourceTxHash: "0xabc123def456789012345678901234567890123456789012345678901234abcd",
+    };
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-//                          TESTS
-// ═══════════════════════════════════════════════════════════════════════
+function createDefaultProfile(): UserRiskProfile {
+    return {
+        accountAddress: "0x9876543210987654321098765432109876543210",
+        availableBalance: parseEther("10000"),  // 10k tokens
+        riskCoefficient: 0.5,
+        maxSlippageBps: 200,
+        minProfitThreshold: parseEther("10"),
+    };
+}
 
-describe("YieldArchitect", () => {
+function createDefaultArbParams(): ArbParams {
+    return {
+        borrowToken: "0x78c1b0C915c4FAA5FffA6CAbf0219DA63d7f4cb8" as Address, // WMNT
+        borrowAmount: parseEther("250"),
+        minProfit: parseEther("5"),
+        swapTarget: "0xDEF171Fe48CF0115B1d80b88dc8eAB59176FEe57" as Address, // Paraswap-like
+        swapCalldata: "0xabcdef1234567890" as Hex,
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//                              TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("YieldArchitect (Swarm Mode)", () => {
     let architect: YieldArchitect;
     let teePrivateKey: `0x${string}`;
-    let teeAddress: `0x${string}`;
-
-    const defaultSignal: SmartMoneySignal = {
-        assetAddress: "0x2222222222222222222222222222222222222222",
-        action: "BUY",
-        sSmart: 500_000, // Кит купил на $500k
-        vSmart: 50_000_000, // Его портфель $50M
-        tag: "Fund",
-        walletAddress: "0x1111111111111111111111111111111111111111",
-        txTimestamp: Math.floor(Date.now() / 1000),
-        txHash: "0xabc123def456abc123def456abc123def456abc123def456abc123def456abc1",
-    };
-
-    const defaultProfile: UserRiskProfile = {
-        balance: 100_000, // $100k пользователя
-        riskFactor: 0.5, // Moderate
-        maxPositionPct: 0.2, // Max 20% в одну позицию
-        minSignalUsd: 10_000, // Игнорировать сделки < $10k
-    };
+    let teeAddress: Address;
 
     beforeEach(() => {
         teePrivateKey = generatePrivateKey();
         teeAddress = privateKeyToAccount(teePrivateKey).address;
-        const mockClient = new MockNansenClient();
-        architect = new YieldArchitect(mockClient, teePrivateKey);
+        architect = new YieldArchitect(teePrivateKey, 5000, ACTIVE_SENTINEL_ADDRESS, 0n);
     });
 
-    // ─── Math & Bounds Tests ─────────────────────────────────────────
+    // ─── Volume Calculation ──────────────────────────────────────────────────
 
-    describe("Weight Calculation (W = S_smart / V_smart)", () => {
-        it("should calculate correct weight", async () => {
-            const result = await architect.generateProposal(defaultSignal, defaultProfile);
-            // W = 500_000 / 50_000_000 = 0.01
-            expect(result.proposal.weight).toBeCloseTo(0.01, 4);
+    describe("Volume Calculation (W = S_smart / V_smart)", () => {
+        it("should calculate correct weight (W = 500k / 10M = 0.05)", () => {
+            const signal = createDefaultSignal();
+            const profile = createDefaultProfile();
+            const amount = architect.calculateVolume(signal, profile);
+
+            // W = 500k/10M = 0.05, S_user = 10k * 0.05 * 0.5 = 250
+            expect(amount).toBe(parseEther("250"));
         });
 
-        it("should calculate correct recommendedAmount", async () => {
-            const result = await architect.generateProposal(defaultSignal, defaultProfile);
-            // S_user = 100_000 * 0.01 * 0.5 = 500
-            expect(result.proposal.recommendedAmount).toBeCloseTo(500, 0);
-        });
+        it("should cap at availableBalance when amount exceeds", () => {
+            const signal = createDefaultSignal();
+            signal.tradeVolume = signal.totalPortfolioValue; // W = 1.0
+            const profile = createDefaultProfile();
+            profile.riskCoefficient = 1.0; // Full aggression
 
-        it("W=1.0 when whale invests entire portfolio (S_smart = V_smart)", async () => {
-            const allInSignal = { ...defaultSignal, sSmart: 50_000_000, vSmart: 50_000_000 };
-            const result = await architect.generateProposal(allInSignal, defaultProfile);
-            // W = 1.0, S_user = 100_000 * 1.0 * 0.5 = 50_000
-            // But maxPositionPct = 0.2, so cap = 100_000 * 0.2 = 20_000
-            expect(result.proposal.recommendedAmount).toBeLessThanOrEqual(20_000);
-        });
-    });
-
-    describe("Safety Caps", () => {
-        it("recommendedAmount NEVER exceeds balance * maxPositionPct", async () => {
-            // Extreme signal: huge W
-            const extremeSignal = { ...defaultSignal, sSmart: 25_000_000, vSmart: 50_000_000 };
-            // W = 0.5, S_user = 100_000 * 0.5 * 0.5 = 25_000
-            // maxPosition = 100_000 * 0.2 = 20_000
-            const result = await architect.generateProposal(extremeSignal, defaultProfile);
-            const maxAllowed = defaultProfile.balance * defaultProfile.maxPositionPct;
-            expect(result.proposal.recommendedAmount).toBeLessThanOrEqual(maxAllowed);
-        });
-
-        it("K_risk = 0 → recommendedAmount = 0 (full pause)", async () => {
-            const pausedProfile = { ...defaultProfile, riskFactor: 0 };
-            const result = await architect.generateProposal(defaultSignal, pausedProfile);
-            expect(result.proposal.recommendedAmount).toBe(0);
-        });
-
-        it("recommendedAmount is never negative", async () => {
-            const result = await architect.generateProposal(defaultSignal, defaultProfile);
-            expect(result.proposal.recommendedAmount).toBeGreaterThanOrEqual(0);
-        });
-
-        it("recommendedAmount NEVER exceeds user balance", async () => {
-            const aggressiveProfile = {
-                ...defaultProfile,
-                riskFactor: 1.0,
-                maxPositionPct: 1.0,
-            };
-            const hugeSignal = { ...defaultSignal, sSmart: 50_000_000, vSmart: 50_000_000 };
-            const result = await architect.generateProposal(hugeSignal, aggressiveProfile);
-            expect(result.proposal.recommendedAmount).toBeLessThanOrEqual(
-                aggressiveProfile.balance
+            // W = 1.0, S_user = 10k * 1.0 * 1.0 = 10k = entire balance
+            const amount = architect.calculateVolume(
+                { ...signal, tradeVolume: signal.totalPortfolioValue },
+                { ...profile, riskCoefficient: 1.0 }
             );
+            expect(amount).toBeLessThanOrEqual(profile.availableBalance);
+        });
+
+        it("should never produce negative amounts", () => {
+            const signal = createDefaultSignal();
+            const profile = createDefaultProfile();
+            const amount = architect.calculateVolume(signal, profile);
+            expect(amount).toBeGreaterThan(0n);
         });
     });
+
+    // ─── Input Validation ────────────────────────────────────────────────────
 
     describe("Input Validation", () => {
-        it("should throw on V_smart = 0 (division by zero)", async () => {
-            const badSignal = { ...defaultSignal, vSmart: 0 };
-            await expect(
-                architect.generateProposal(badSignal, defaultProfile)
-            ).rejects.toThrow("Invalid Smart Money volume");
+        it("should throw on totalPortfolioValue = 0 (division by zero)", () => {
+            const signal = { ...createDefaultSignal(), totalPortfolioValue: 0n };
+            expect(() => architect.calculateVolume(signal, createDefaultProfile()))
+                .toThrow("totalPortfolioValue cannot be zero");
         });
 
-        it("should throw on V_smart < 0", async () => {
-            const badSignal = { ...defaultSignal, vSmart: -1 };
-            await expect(
-                architect.generateProposal(badSignal, defaultProfile)
-            ).rejects.toThrow("Invalid Smart Money volume");
+        it("should throw on tradeVolume = 0", () => {
+            const signal = { ...createDefaultSignal(), tradeVolume: 0n };
+            expect(() => architect.calculateVolume(signal, createDefaultProfile()))
+                .toThrow("tradeVolume cannot be zero");
         });
 
-        it("should throw on signal below minSignalUsd", async () => {
-            const tinySignal = { ...defaultSignal, sSmart: 5_000 }; // Below 10k threshold
-            await expect(
-                architect.generateProposal(tinySignal, defaultProfile)
-            ).rejects.toThrow("Signal too small");
+        it("should throw on tradeVolume > totalPortfolioValue", () => {
+            const signal = { ...createDefaultSignal(), tradeVolume: parseEther("99999999") };
+            expect(() => architect.calculateVolume(signal, createDefaultProfile()))
+                .toThrow("tradeVolume > totalPortfolioValue");
         });
 
-        it("should throw on riskFactor > 1", async () => {
-            const badProfile = { ...defaultProfile, riskFactor: 1.5 };
-            await expect(
-                architect.generateProposal(defaultSignal, badProfile)
-            ).rejects.toThrow("riskFactor must be in [0, 1]");
+        it("should throw on riskCoefficient > 1.0", () => {
+            const profile = { ...createDefaultProfile(), riskCoefficient: 1.5 };
+            expect(() => architect.calculateVolume(createDefaultSignal(), profile))
+                .toThrow("riskCoefficient must be in [0.1, 1.0]");
         });
 
-        it("should throw on riskFactor < 0", async () => {
-            const badProfile = { ...defaultProfile, riskFactor: -0.1 };
-            await expect(
-                architect.generateProposal(defaultSignal, badProfile)
-            ).rejects.toThrow("riskFactor must be in [0, 1]");
-        });
-    });
-
-    // ─── EIP-712 Signature Tests ─────────────────────────────────────
-
-    describe("Proof-of-Reasoning (EIP-712 Signature)", () => {
-        it("should produce valid signature from TEE key", async () => {
-            const result = await architect.generateProposal(defaultSignal, defaultProfile);
-            expect(result.proofOfReasoning).toMatch(/^0x[a-fA-F0-9]{130}$/);
+        it("should throw on riskCoefficient < 0.1", () => {
+            const profile = { ...createDefaultProfile(), riskCoefficient: 0.05 };
+            expect(() => architect.calculateVolume(createDefaultSignal(), profile))
+                .toThrow("riskCoefficient must be in [0.1, 1.0]");
         });
 
-        it("teeSignerAddress matches the TEE key", async () => {
-            const result = await architect.generateProposal(defaultSignal, defaultProfile);
-            expect(result.teeSignerAddress.toLowerCase()).toBe(teeAddress.toLowerCase());
-        });
-
-        it("signature is deterministic for same inputs", async () => {
-            // Freeze timestamp for determinism
-            const now = Math.floor(Date.now() / 1000);
-            const signal = { ...defaultSignal, txTimestamp: now };
-
-            const result1 = await architect.generateProposal(signal, defaultProfile);
-            const result2 = await architect.generateProposal(signal, defaultProfile);
-
-            // reasoningHash should be identical
-            expect(result1.proposal.reasoningHash).toBe(result2.proposal.reasoningHash);
-        });
-
-        it("different signals produce different signatures", async () => {
-            const signal2 = { ...defaultSignal, sSmart: 1_000_000 };
-
-            const result1 = await architect.generateProposal(defaultSignal, defaultProfile);
-            const result2 = await architect.generateProposal(signal2, defaultProfile);
-
-            expect(result1.proofOfReasoning).not.toBe(result2.proofOfReasoning);
+        it("should throw on availableBalance = 0", () => {
+            const profile = { ...createDefaultProfile(), availableBalance: 0n };
+            expect(() => architect.calculateVolume(createDefaultSignal(), profile))
+                .toThrow("availableBalance is zero");
         });
     });
 
-    // ─── Confidence Scoring ──────────────────────────────────────────
+    // ─── Insight Hash (Proof-of-Alpha — UNCHANGED) ───────────────────────────
 
-    describe("Confidence by Tag", () => {
-        it("Fund tag → confidence 0.9", async () => {
-            const result = await architect.generateProposal(defaultSignal, defaultProfile);
-            expect(result.proposal.confidence).toBe(0.9);
+    describe("InsightHash (Proof-of-Alpha)", () => {
+        it("should produce deterministic hash for same inputs", () => {
+            const hash1 = architect.computeInsightHash(
+                "0x78c1b0C915c4FAA5FffA6CAbf0219DA63d7f4cb8",
+                "BUY",
+                parseEther("250"),
+                1700000000
+            );
+            const hash2 = architect.computeInsightHash(
+                "0x78c1b0C915c4FAA5FffA6CAbf0219DA63d7f4cb8",
+                "BUY",
+                parseEther("250"),
+                1700000000
+            );
+            expect(hash1).toBe(hash2);
         });
 
-        it("VC tag → confidence 0.85", async () => {
-            const vcSignal = { ...defaultSignal, tag: "VC" as const };
-            const result = await architect.generateProposal(vcSignal, defaultProfile);
-            expect(result.proposal.confidence).toBe(0.85);
+        it("should produce different hash for different inputs", () => {
+            const hash1 = architect.computeInsightHash(
+                "0x78c1b0C915c4FAA5FffA6CAbf0219DA63d7f4cb8",
+                "BUY",
+                parseEther("250"),
+                1700000000
+            );
+            const hash2 = architect.computeInsightHash(
+                "0x78c1b0C915c4FAA5FffA6CAbf0219DA63d7f4cb8",
+                "SELL",  // different action
+                parseEther("250"),
+                1700000000
+            );
+            expect(hash1).not.toBe(hash2);
         });
 
-        it("90D Smart Trader → confidence 0.7", async () => {
-            const traderSignal = { ...defaultSignal, tag: "90D Smart Trader" as const };
-            const result = await architect.generateProposal(traderSignal, defaultProfile);
-            expect(result.proposal.confidence).toBe(0.7);
+        it("should produce valid bytes32 hex", () => {
+            const hash = architect.computeInsightHash(
+                "0x78c1b0C915c4FAA5FffA6CAbf0219DA63d7f4cb8",
+                "BUY",
+                parseEther("250"),
+                1700000000
+            );
+            expect(hash).toMatch(/^0x[a-fA-F0-9]{64}$/);
         });
     });
 
-    // ─── Aggregation Tests ───────────────────────────────────────────
+    // ─── ForwardRequest EIP-712 Signature (NEW — Swarm Mode) ─────────────────
 
-    describe("Multi-Signal Aggregation", () => {
-        it("multiple whales buying → boosted confidence", async () => {
-            const signals: SmartMoneySignal[] = [
-                defaultSignal,
-                { ...defaultSignal, walletAddress: "0x3333333333333333333333333333333333333333", sSmart: 300_000 },
-                { ...defaultSignal, walletAddress: "0x4444444444444444444444444444444444444444", sSmart: 700_000 },
-            ];
+    describe("ForwardRequest EIP-712 Signature", () => {
+        it("should generate valid ForwardRequest with correct structure", async () => {
+            const arbParams = createDefaultArbParams();
+            const insightHash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" as Hex;
+            const commitTxHash = "0x1111111111111111111111111111111111111111111111111111111111111111" as `0x${string}`;
 
-            const result = await architect.generateAggregatedProposal(signals, defaultProfile);
+            const signed = await architect.generateForwardRequest(
+                arbParams, insightHash, commitTxHash, 300
+            );
 
-            // 3 signals → boost factor = 1 + log2(3) * 0.1 ≈ 1.158
-            // Confidence = 0.9 * 1.158 ≈ 1.04 → capped at 0.95
-            expect(result.proposal.confidence).toBeLessThanOrEqual(0.95);
-            expect(result.proposal.confidence).toBeGreaterThan(0.9);
+            // Verify structure
+            expect(signed.request.target).toBe(ACTIVE_SENTINEL_ADDRESS);
+            expect(signed.request.value).toBe(0n);
+            expect(signed.request.nonce).toBe(0n); // First request
+            expect(signed.request.data).toMatch(/^0x/); // Encoded calldata
+            expect(signed.signature).toMatch(/^0x[a-fA-F0-9]{130}$/);
+            expect(signed.signerAddress).toBe(teeAddress);
+            expect(signed.insightHash).toBe(insightHash);
+            expect(signed.commitTxHash).toBe(commitTxHash);
         });
 
-        it("should throw on mixed assets in aggregation", async () => {
-            const signals: SmartMoneySignal[] = [
-                defaultSignal,
-                { ...defaultSignal, assetAddress: "0x9999999999999999999999999999999999999999" },
-            ];
+        it("EIP-712 signature should recover to TEE signer address", async () => {
+            const arbParams = createDefaultArbParams();
+            const insightHash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" as Hex;
+            const commitTxHash = "0x1111111111111111111111111111111111111111111111111111111111111111" as `0x${string}`;
 
-            await expect(
-                architect.generateAggregatedProposal(signals, defaultProfile)
-            ).rejects.toThrow("Cannot aggregate signals for different assets");
+            const signed = await architect.generateForwardRequest(
+                arbParams, insightHash, commitTxHash, 300
+            );
+
+            // Recover signer from EIP-712 signature via viem
+            const recoveredValid = await verifyTypedData({
+                address: teeAddress,
+                domain: {
+                    ...DISPATCHER_EIP712_DOMAIN,
+                    chainId: 5000,
+                },
+                types: FORWARD_REQUEST_TYPES,
+                primaryType: "ForwardRequest",
+                message: {
+                    target: signed.request.target,
+                    data: signed.request.data,
+                    value: signed.request.value,
+                    nonce: signed.request.nonce,
+                    deadline: signed.request.deadline,
+                },
+                signature: signed.signature,
+            });
+
+            expect(recoveredValid).toBe(true);
         });
 
-        it("should throw on empty signals array", async () => {
-            await expect(
-                architect.generateAggregatedProposal([], defaultProfile)
-            ).rejects.toThrow("No signals to aggregate");
+        it("signature should NOT verify with wrong signer", async () => {
+            const arbParams = createDefaultArbParams();
+            const insightHash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" as Hex;
+            const commitTxHash = "0x1111111111111111111111111111111111111111111111111111111111111111" as `0x${string}`;
+
+            const signed = await architect.generateForwardRequest(
+                arbParams, insightHash, commitTxHash, 300
+            );
+
+            // Try to verify with random address (should fail)
+            const wrongAddress = privateKeyToAccount(generatePrivateKey()).address;
+            const isValidForWrong = await verifyTypedData({
+                address: wrongAddress,
+                domain: {
+                    ...DISPATCHER_EIP712_DOMAIN,
+                    chainId: 5000,
+                },
+                types: FORWARD_REQUEST_TYPES,
+                primaryType: "ForwardRequest",
+                message: {
+                    target: signed.request.target,
+                    data: signed.request.data,
+                    value: signed.request.value,
+                    nonce: signed.request.nonce,
+                    deadline: signed.request.deadline,
+                },
+                signature: signed.signature,
+            });
+
+            expect(isValidForWrong).toBe(false);
+        });
+
+        it("nonce should increment monotonically", async () => {
+            const arbParams = createDefaultArbParams();
+            const insightHash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" as Hex;
+            const commitTxHash = "0x1111111111111111111111111111111111111111111111111111111111111111" as `0x${string}`;
+
+            const signed1 = await architect.generateForwardRequest(
+                arbParams, insightHash, commitTxHash
+            );
+            const signed2 = await architect.generateForwardRequest(
+                arbParams, insightHash, commitTxHash
+            );
+            const signed3 = await architect.generateForwardRequest(
+                arbParams, insightHash, commitTxHash
+            );
+
+            expect(signed1.request.nonce).toBe(0n);
+            expect(signed2.request.nonce).toBe(1n);
+            expect(signed3.request.nonce).toBe(2n);
+            expect(architect.currentNonce).toBe(3n);
+        });
+
+        it("deadline should be in the future", async () => {
+            const arbParams = createDefaultArbParams();
+            const insightHash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" as Hex;
+            const commitTxHash = "0x1111111111111111111111111111111111111111111111111111111111111111" as `0x${string}`;
+
+            const signed = await architect.generateForwardRequest(
+                arbParams, insightHash, commitTxHash, 300
+            );
+
+            const now = BigInt(Math.floor(Date.now() / 1000));
+            expect(signed.request.deadline).toBeGreaterThan(now);
+            expect(signed.request.deadline).toBeLessThanOrEqual(now + 305n); // 300s + small buffer
+        });
+
+        it("different arbParams produce different calldata", async () => {
+            const insightHash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" as Hex;
+            const commitTxHash = "0x1111111111111111111111111111111111111111111111111111111111111111" as `0x${string}`;
+
+            const arbParams1 = createDefaultArbParams();
+            const arbParams2 = { ...createDefaultArbParams(), borrowAmount: parseEther("500") };
+
+            const signed1 = await architect.generateForwardRequest(
+                arbParams1, insightHash, commitTxHash
+            );
+            const signed2 = await architect.generateForwardRequest(
+                arbParams2, insightHash, commitTxHash
+            );
+
+            expect(signed1.request.data).not.toBe(signed2.request.data);
+        });
+    });
+
+    // ─── Legacy Proposal (backward compat) ───────────────────────────────────
+
+    describe("Legacy Proposal Generation (Proof-of-Reasoning)", () => {
+        it("should generate valid SignedProposal", async () => {
+            const signal = createDefaultSignal();
+            const profile = createDefaultProfile();
+
+            const signed = await architect.generateProposal(signal, profile, 300);
+
+            expect(signed.asset).toBe(signal.asset);
+            expect(signed.action).toBe("BUY");
+            expect(signed.recommendedAmount).toBe(parseEther("250"));
+            expect(signed.signature).toMatch(/^0x[a-fA-F0-9]{130}$/);
+            expect(signed.signerAddress).toBe(teeAddress);
+            expect(signed.insightHash).toMatch(/^0x[a-fA-F0-9]{64}$/);
+            expect(signed.reasoningHash).toMatch(/^0x[a-fA-F0-9]{64}$/);
+        });
+
+        it("reasoningHash should be deterministic for same inputs", async () => {
+            const signal = createDefaultSignal();
+            const profile = createDefaultProfile();
+            const amount = architect.calculateVolume(signal, profile);
+
+            const hash1 = architect.computeReasoningHash(signal, profile, amount);
+            const hash2 = architect.computeReasoningHash(signal, profile, amount);
+
+            expect(hash1).toBe(hash2);
+        });
+    });
+
+    // ─── Isolation Invariant ─────────────────────────────────────────────────
+
+    describe("Isolation: TEE → Redis only (no TX sending)", () => {
+        it("YieldArchitect has NO method for sending transactions", () => {
+            const methods = Object.getOwnPropertyNames(Object.getPrototypeOf(architect));
+            expect(methods).not.toContain("sendTransaction");
+            expect(methods).not.toContain("executeArbitrage");
+            expect(methods).not.toContain("relay");
+            expect(methods).not.toContain("broadcast");
+        });
+
+        it("generateForwardRequest returns data, not a tx receipt", async () => {
+            const arbParams = createDefaultArbParams();
+            const insightHash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890" as Hex;
+            const commitTxHash = "0x1111111111111111111111111111111111111111111111111111111111111111" as `0x${string}`;
+
+            const result = await architect.generateForwardRequest(
+                arbParams, insightHash, commitTxHash
+            );
+
+            // Result is a signed payload, NOT a transaction receipt
+            expect(result).toHaveProperty("request");
+            expect(result).toHaveProperty("signature");
+            expect(result).not.toHaveProperty("txHash");
+            expect(result).not.toHaveProperty("receipt");
+            expect(result).not.toHaveProperty("gasUsed");
         });
     });
 });

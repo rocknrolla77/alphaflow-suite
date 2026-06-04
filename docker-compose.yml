@@ -82,6 +82,63 @@ services:
     profiles:
       - dev  # Only runs in development
 
+  # ─── Byreal Swarm Workers (Race Condition Relay) ───────────────────
+  # 3 independent workers compete to relay ForwardRequest on-chain.
+  # First to succeed gets MNT refund from MicroFundingDispatcher.
+  byreal-worker-1:
+    build:
+      context: ./agent-tee
+      dockerfile: Dockerfile
+    container_name: alphaflow_worker_1
+    command: npm run start:worker
+    environment:
+      - RELAYER_PRIVATE_KEY=${WORKER_1_KEY}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-alphaflow_dev}@redis:6379
+      - RPC_URL=${MANTLE_RPC_PRIMARY:-https://rpc.mantle.xyz}
+      - DISPATCHER_ADDRESS=${DISPATCHER_ADDRESS}
+      - WORKER_ID=byreal-worker-1
+      - STREAM_KEY=agent_insights
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  byreal-worker-2:
+    build:
+      context: ./agent-tee
+      dockerfile: Dockerfile
+    container_name: alphaflow_worker_2
+    command: npm run start:worker
+    environment:
+      - RELAYER_PRIVATE_KEY=${WORKER_2_KEY}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-alphaflow_dev}@redis:6379
+      - RPC_URL=${MANTLE_RPC_PRIMARY:-https://rpc.mantle.xyz}
+      - DISPATCHER_ADDRESS=${DISPATCHER_ADDRESS}
+      - WORKER_ID=byreal-worker-2
+      - STREAM_KEY=agent_insights
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  byreal-worker-3:
+    build:
+      context: ./agent-tee
+      dockerfile: Dockerfile
+    container_name: alphaflow_worker_3
+    command: npm run start:worker
+    environment:
+      - RELAYER_PRIVATE_KEY=${WORKER_3_KEY}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-alphaflow_dev}@redis:6379
+      - RPC_URL=${MANTLE_RPC_PRIMARY:-https://rpc.mantle.xyz}
+      - DISPATCHER_ADDRESS=${DISPATCHER_ADDRESS}
+      - WORKER_ID=byreal-worker-3
+      - STREAM_KEY=agent_insights
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   # ─── Anvil (Mantle Fork for Testing) ───────────────────────────────
   anvil:
     image: ghcr.io/foundry-rs/foundry:latest

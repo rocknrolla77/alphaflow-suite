@@ -122,13 +122,87 @@ export interface SignedProposal extends Proposal {
 }
 
 /**
- * EIP-712 Domain для AlphaFlow TEE.
+ * EIP-712 Domain для AlphaFlow TEE (Proposal подпись — legacy Proof-of-Reasoning).
  * Используется при подписании Proposals.
  */
 export interface EIP712Domain {
     readonly name: string;
     readonly version: string;
     readonly chainId: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SWARM MODE: MicroFundingDispatcher EIP-712 Types
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * ForwardRequest — структура, подписываемая TEE-агентом для MicroFundingDispatcher.
+ * Relayer (Byreal Swarm Worker) отправляет её on-chain и получает MNT рефанд.
+ *
+ * Соответствует on-chain struct:
+ *   struct ForwardRequest {
+ *       address target;
+ *       bytes data;
+ *       uint256 value;
+ *       uint256 nonce;
+ *       uint256 deadline;
+ *   }
+ */
+export interface ForwardRequest {
+    /** Адрес целевого контракта (ActiveSentinel) */
+    readonly target: `0x${string}`;
+    /** Encoded calldata (executeFlashArbitrage) */
+    readonly data: `0x${string}`;
+    /** msg.value для вызова (обычно 0n для flash arb) */
+    readonly value: bigint;
+    /** Monotonic nonce TEE-агента (replay protection в Dispatcher) */
+    readonly nonce: bigint;
+    /** Unix timestamp deadline (секунды) */
+    readonly deadline: bigint;
+}
+
+/**
+ * EIP-712 конфигурация для MicroFundingDispatcher.
+ * Должна совпадать с on-chain конструктором:
+ *   EIP712("MicroFundingDispatcher", "1")
+ */
+export const DISPATCHER_EIP712_DOMAIN = {
+    name: "MicroFundingDispatcher" as const,
+    version: "1" as const,
+    chainId: 5000,
+} as const;
+
+/**
+ * EIP-712 TypeHash для ForwardRequest.
+ * keccak256("ForwardRequest(address target,bytes data,uint256 value,uint256 nonce,uint256 deadline)")
+ */
+export const FORWARD_REQUEST_TYPES = {
+    ForwardRequest: [
+        { name: "target", type: "address" },
+        { name: "data", type: "bytes" },
+        { name: "value", type: "uint256" },
+        { name: "nonce", type: "uint256" },
+        { name: "deadline", type: "uint256" },
+    ],
+} as const;
+
+/**
+ * Signed ForwardRequest — payload, публикуемый в Redis Stream
+ * для подхвата Byreal Swarm Workers.
+ */
+export interface SignedForwardRequest {
+    /** Сам ForwardRequest */
+    readonly request: ForwardRequest;
+    /** EIP-712 подпись (hex, 65 bytes) */
+    readonly signature: `0x${string}`;
+    /** Публичный адрес TEE-signer */
+    readonly signerAddress: `0x${string}`;
+    /** Unix timestamp генерации */
+    readonly generatedAt: number;
+    /** InsightHash (для корреляции с Proof-of-Alpha) */
+    readonly insightHash: string;
+    /** Commit TX hash (proof что insight закоммичен before relay) */
+    readonly commitTxHash: string;
 }
 
 /**
@@ -152,6 +226,12 @@ export interface AgentConfig {
 
     /** Адрес контракта AlphaAuditor (Proof-of-Alpha Registry) */
     readonly alphaAuditorAddress: string;
+
+    /** Адрес контракта MicroFundingDispatcher (Swarm Mode relay) */
+    readonly dispatcherAddress: string;
+
+    /** Адрес контракта ActiveSentinel (target для ForwardRequest) */
+    readonly activeSentinelAddress: string;
 
     /** Agent ID (tokenId в SentinelIdentity) */
     readonly agentId: bigint;
