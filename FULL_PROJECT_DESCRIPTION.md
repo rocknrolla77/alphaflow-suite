@@ -1,903 +1,1253 @@
-# AlphaFlow Suite — Полное описание проекта
+# AlphaFlow Suite — Complete Project Documentation
 
-> AI-powered flash arbitrage система на Mantle Network с TEE-защитой, Human-in-the-Loop подтверждением и ERC-8004 идентификацией агента.
-
-**Победитель DoraHacks Mantle Hackathon**
-
----
-
-## Оглавление
-
-1. [Обзор архитектуры](#обзор-архитектуры)
-2. [Модуль 1: Smart Contracts (contracts/)](#модуль-1-smart-contracts)
-3. [Модуль 2: TEE Agent (agent-tee/)](#модуль-2-tee-agent)
-4. [Модуль 3: BFF Server (bff/)](#модуль-3-bff-server)
-5. [Модуль 4: Telegram Mini App (frontend/)](#модуль-4-telegram-mini-app)
-6. [Модуль 5: DevOps / Telegram Bot (devops/)](#модуль-5-devops--telegram-bot)
-7. [Инфраструктура и деплой](#инфраструктура-и-деплой)
-8. [Безопасность](#безопасность)
-9. [Потоки данных (End-to-End)](#потоки-данных-end-to-end)
-10. [Переменные окружения](#переменные-окружения)
-11. [Статус и roadmap](#статус-и-roadmap)
+> **Flash Arbitrage Intelligence System on Mantle Network**
+> Winner of DoraHacks Mantle Hackathon · Phase 2: AI Awakening
 
 ---
 
-## Обзор архитектуры
+## Table of Contents
+
+1. [Executive Summary](#executive-summary)
+2. [Architecture Overview](#architecture-overview)
+3. [System Components](#system-components)
+   - [Smart Contracts (Foundry/Solidity)](#1-smart-contracts-foundrysoldity-0824)
+   - [TEE Agent (Phala DStack CVM)](#2-tee-agent-phala-dstack-cvm)
+   - [Backend-for-Frontend (Hono)](#3-backend-for-frontend-bff--hono)
+   - [Frontend PWA (Vite + React)](#4-frontend-pwa-vite--react)
+4. [Data Flow & Pipeline](#data-flow--pipeline)
+5. [Security Model](#security-model)
+6. [Deployment Architecture](#deployment-architecture)
+7. [On-Chain Contracts (Mantle Mainnet)](#on-chain-contracts-mantle-mainnet)
+8. [E2E Qualification Test Results](#e2e-qualification-test-results)
+9. [Configuration & Environment](#configuration--environment)
+10. [Directory Structure](#directory-structure)
+11. [Build & Run](#build--run)
+12. [Testing Strategy](#testing-strategy)
+13. [Protocol Integrations](#protocol-integrations)
+14. [ERC-8004 Agent Identity Standard](#erc-8004-agent-identity-standard)
+15. [Circuit Breaker Safety System](#circuit-breaker-safety-system)
+16. [Proof-of-Alpha Mechanism](#proof-of-alpha-mechanism)
+
+---
+
+## Executive Summary
+
+AlphaFlow Suite is an AI-powered flash arbitrage system deployed on **Mantle Network (L2, Chain ID: 5000)**. It combines:
+
+- **TEE-secured AI agent** (Phala Network CVM) that monitors smart money wallets via Nansen MCP, discovers correlated wallet clusters, and generates flash arbitrage proposals using GPT-4 reasoning
+- **Atomic flash arbitrage contracts** borrowing from INIT Capital, swapping across Merchant Moe and Agni Finance DEXes
+- **Cryptographic Proof-of-Alpha** — every insight is hashed (keccak256) and committed on-chain before execution, creating an immutable audit trail
+- **Real-time cyberpunk dashboard** with SIWE authentication, WebSocket streaming, and on-chain verification
+
+The system operates in **User-Pays mode** (EOA signs transactions, pays gas in MNT) with full Human-in-the-Loop approval via the PWA terminal interface.
+
+---
+
+## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          AlphaFlow Suite                                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  ┌──────────────┐    Redis Pub/Sub    ┌──────────────┐                   │
-│  │  agent-tee   │ ──────────────────► │   devops/    │                   │
-│  │  (Phala TEE) │                     │   tg-bot     │                   │
-│  └──────┬───────┘                     └──────┬───────┘                   │
-│         │                                    │                            │
-│         │ EIP-712 signed proposals           │ Inline keyboard            │
-│         ▼                                    ▼ (Approve/Reject)           │
-│  ┌──────────────┐    HMAC + Lock      ┌──────────────┐                   │
-│  │    Redis     │ ◄────────────────── │   frontend/  │                   │
-│  │   (store)    │                     │  TMA (React) │                   │
-│  └──────┬───────┘                     └──────┬───────┘                   │
-│         │                                    │                            │
-│         │ Proposal data                      │ WebAuthn Passkeys          │
-│         ▼                                    ▼                            │
-│  ┌──────────────┐    Simulate + Exec  ┌──────────────────┐               │
-│  │  bff/ (Hono) │ ──────────────────► │  Mantle Network  │               │
-│  │  Port 3001   │                     │  (Smart Contracts)│               │
-│  └──────────────┘                     └──────────────────┘               │
-│                                                                           │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           MANTLE NETWORK (L2)                                 │
+│                                                                              │
+│  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────────────────┐ │
+│  │ SentinelIdentity │  │  AlphaAuditor    │  │     ActiveSentinel          │ │
+│  │ (ERC-8004 NFT)  │  │ (Proof-of-Alpha) │  │ (Flash Arb Engine)          │ │
+│  │ Agent Registry   │  │ Event-only Hash  │  │ INIT → MerchantMoe → Agni  │ │
+│  └────────┬────────┘  └────────┬─────────┘  └──────────────┬──────────────┘ │
+│           │                     │                            │                │
+│           │    ┌────────────────┴────────────────┐           │                │
+│           └────┤     ReputationRegistry          ├───────────┘                │
+│                │  (Batch Oracle, int128 scores)   │                           │
+│                └─────────────────────────────────┘                           │
+└──────────────────────────────────────────────────────────────────────────────┘
+         ▲                    ▲                           ▲
+         │ registerAgent      │ commitInsight             │ executeFlashArbitrage
+         │                    │                           │
+┌────────┴────────────────────┴───────────────────────────┴────────────────────┐
+│                         TEE AGENT (Phala DStack CVM)                          │
+│                                                                              │
+│  ┌──────────────┐  ┌───────────────┐  ┌──────────────┐  ┌────────────────┐ │
+│  │ NansenClient │  │ClusterEngine  │  │YieldArchitect│  │CircuitBreaker  │ │
+│  │ (MCP API)    │→ │(Wallet Groups)│→ │(EIP-712 Sign)│→ │(Safety Halt)   │ │
+│  └──────────────┘  └───────────────┘  └──────────────┘  └────────────────┘ │
+│         │                                      │                             │
+│         │           ┌──────────────────────────┘                             │
+│         │           ▼                                                        │
+│         │  ┌──────────────────┐                                              │
+│         │  │SentinelExecutor  │ ← commitInsight() on-chain (BLOCKING)        │
+│         │  └────────┬─────────┘                                              │
+│         │           │                                                        │
+│         │           ▼                                                        │
+│         │  ┌──────────────────┐     ┌─────────────┐                         │
+│         │  │ProposalPublisher │────→│ Redis Stream │ (agent_insights)        │
+│         │  └──────────────────┘     └──────┬──────┘                         │
+│         │                                   │                                │
+└─────────┴───────────────────────────────────┼────────────────────────────────┘
+                                              │
+                                              ▼ XREAD BLOCK
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    BFF (Backend-for-Frontend) — Hono, Port 3001              │
+│                                                                             │
+│  ┌───────────────┐  ┌────────────────────┐  ┌─────────────────────────────┐│
+│  │ HMAC Verifier │  │ WebSocket Server   │  │   Reputation Batcher        ││
+│  │(timing-safe)  │  │(JWT auth, Redis→WS)│  │(Redis → ReputationRegistry) ││
+│  └───────────────┘  └─────────┬──────────┘  └─────────────────────────────┘│
+│                                │                                             │
+└────────────────────────────────┼─────────────────────────────────────────────┘
+                                 │ WebSocket (wss://)
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    FRONTEND PWA (Vite + React + RainbowKit)                  │
+│                                                                             │
+│  ┌──────────┐ ┌────────────────┐ ┌──────────────┐ ┌─────────────────────┐ │
+│  │  SIWE    │ │LiveAgentConsole│ │ProofOfAlpha  │ │ ERC8004Explorer     │ │
+│  │  Auth    │ │(Real-time feed)│ │(Hash verify) │ │ (Agent Cards)       │ │
+│  └──────────┘ └────────────────┘ └──────────────┘ └─────────────────────┘ │
+│  ┌────────────────┐ ┌──────────────┐ ┌────────────────────────────────────┐│
+│  │ReputationHeatmap│ │RWARiskPanel  │ │        MEVMetrics                  ││
+│  │(Epoch scores)   │ │(Risk levels) │ │(TSTORE vs SSTORE gas comparison)  ││
+│  └────────────────┘ └──────────────┘ └────────────────────────────────────┘│
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                     ProposalView (Execute Flash Arbitrage)               ││
+│  │       User signs EIP-712 → executeFlashArbitrage() → MNT gas paid       ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
-
-### Технологический стек
-
-| Слой | Технологии |
-|------|-----------|
-| Blockchain | Mantle Network (L2 Ethereum), Solidity 0.8.24, EVM Cancun (EIP-1153) |
-| Smart Contracts | Foundry, OpenZeppelin, ERC-8004 (AI Agent Identity) |
-| TEE Agent | TypeScript, Phala DStack SDK, OpenAI GPT-4, viem |
-| Account Abstraction | ZeroDev SDK, Kernel v3.1, Passkey Validator, Session Keys |
-| BFF Server | Hono ^4.4, Node.js ≥20, ioredis, viem, Zod |
-| Frontend | React 18, Vite, @telegram-apps/sdk, @tonconnect/ui-react, WebAuthn |
-| Bot | Grammy (Telegram), ioredis |
-| Infra | Redis 7 (AOF), GCP VM, Cloudflare Quick Tunnel |
-| Data | Nansen API (smart money), Pyth Network (oracles) |
-| DEXs | INIT Capital (flash loans), Merchant Moe, Agni Finance |
 
 ---
 
-## Модуль 1: Smart Contracts
+## System Components
 
-**Путь:** `contracts/`  
-**Язык:** Solidity 0.8.24  
-**Фреймворк:** Foundry (forge)  
-**Тесты:** 57/57 passing (4 test suites)
+### 1. Smart Contracts (Foundry/Solidity 0.8.24)
 
-### 1.1 ActiveSentinel.sol (371 строк) — Ядро исполнения
+Located in `contracts/`. Compiled with Foundry (forge), Solc 0.8.24, EVM target: Cancun, optimizer: 200 runs.
 
-Основной контракт для flash-арбитража:
+#### ActiveSentinel.sol — Core Flash Arbitrage Engine
 
-- **Flash Borrow** от INIT Capital (бесплатный займ в одной транзакции)
-- **2-ноги арбитраж:** Route1 (Merchant Moe: TokenA→TokenB) + Route2 (Agni: TokenB→TokenA)
-- **Гибридная защита от reentrancy:** TSTORE (EIP-1153, 100 gas) + SSTORE (fallback)
-- **EIP-712 верификация подписи** от авторизованного TEE агента
-- **Token whitelist** — только одобренные токены
-- **Nonce replay protection** — предотвращение повторного исполнения
-- **ERC-8004 интеграция** — связь с IdentityRegistry (agentId)
-- **Admin функции:** rescue tokens, update TEE agent address, manage whitelist
+The heart of the system. Executes atomic flash loan arbitrage:
 
-**Ключевые функции:**
+1. **Flash borrows** token A from INIT Capital (`flashBorrow`)
+2. **Swaps** A → B on Merchant Moe (LBRouter)
+3. **Swaps** B → A on Agni Finance (UniV3 exactInputSingle)
+4. **Repays** flash loan + fee
+5. **Keeps** profit (sent to `beneficiary`)
+
 ```solidity
-function executeFlashArbitrage(ArbParams calldata params, bytes calldata signature) external
-function onFlashBorrow(address token, uint256 amount, bytes calldata data) external  // callback
-function rescueToken(address token, uint256 amount) external onlyOwner
-function setTeeAgent(address newAgent) external onlyOwner
-```
+function executeFlashArbitrage(ArbParams calldata params, bytes calldata teeSignature) external;
 
-**Структура ArbParams (EIP-712 typed):**
-```solidity
 struct ArbParams {
-    address tokenBorrow;      // Какой токен занимаем
-    uint256 amountBorrow;     // Сколько
-    address route1Adapter;    // Merchant Moe adapter
-    bytes route1Payload;      // Параметры свапа
-    address route2Adapter;    // Agni adapter
-    bytes route2Payload;      // Параметры свапа
-    uint256 minProfit;        // Минимальная прибыль (иначе revert)
-    uint256 deadline;         // Unix timestamp дедлайн
-    uint256 nonce;            // Replay protection
-    bytes32 reasoningHash;    // keccak256 от LLM reasoning (прозрачность)
+    address tokenBorrow;     // Token to flash borrow
+    uint256 borrowAmount;    // Amount to borrow
+    address tokenIntermediate; // Intermediate swap token
+    address beneficiary;     // Profit recipient
+    uint256 minProfit;       // Minimum acceptable profit (slippage protection)
+    uint256 deadline;        // Execution deadline (block.timestamp)
+    uint256 nonce;           // Replay protection
 }
 ```
 
-### 1.2 SentinelIdentity.sol (118 строк) — Agent NFT Registry
+**Security Features:**
+- **Hybrid Reentrancy Guard** — TSTORE/TLOAD (EIP-1153, 100 gas) + SSTORE fallback (5000 gas). Dual protection against reentrancy in all execution contexts.
+- **EIP-712 Signature Verification** — TEE agent signs ArbParams off-chain. Contract verifies on-chain. Only registered TEE signer can authorize trades.
+- **Token Whitelist** — `whitelistedTokens` mapping prevents ERC-777 transfer hooks from being exploited.
+- **Nonce Replay Protection** — `usedNonces` mapping. Each nonce can only be used once.
+- **Context Validation (H-08)** — Flash loan callback verifies `msg.sender == initCore && initiator == address(this)` to prevent direct callback invocation.
+- **Deadline Enforcement** — `block.timestamp <= params.deadline` prevents stale executions.
 
-ERC-721 NFT для идентификации AI-агента:
+#### SentinelIdentity.sol — ERC-8004 Agent Identity
 
-- Одна подписка = один агент (soulbound-like, нетрансферабельный)
-- Хранит Agent Card URI (ipfs://)
-- `registerAgent()` — минт NFT
-- `updateAgentCard()` — ротация URI метаданных
-- Обратный маппинг `agentOf[address]` для поиска
+ERC-721 NFT registry implementing the ERC-8004 Agent Card standard:
 
-### 1.3 AlphaAuditor.sol (90 строк) — Proof-of-Alpha
+```solidity
+function registerAgent(string calldata agentCardURI) external returns (uint256 tokenId);
+function updateAgentCard(uint256 tokenId, string calldata newURI) external;
+```
 
-Gas-оптимизированный реестр инсайтов:
+- One agent per address (soulbound-like, 1:1 mapping)
+- Monotonic counter (tokenId starts at 1, 0 = not registered)
+- Agent Card URI stores JSON metadata (capabilities, TEE attestation, version)
+- Required for AlphaAuditor access (only agent owners can commit insights)
 
-- Хранит `keccak256(insight)` только как event (не в storage — экономия газа)
-- Только зарегистрированные агенты могут коммитить
-- Счётчик коммитов на агента
-- CEI (Checks-Effects-Interactions) паттерн
+#### AlphaAuditor.sol — Proof-of-Alpha Registry
 
-### 1.4 ReputationRegistry.sol (213 строк) — On-chain Репутация
+Gas-optimized event-only hash registry:
 
-Пакетная система репутации:
+```solidity
+function commitInsight(uint256 agentId, bytes32 insightHash) external;
+event InsightCommitted(uint256 indexed agentId, bytes32 indexed insightHash, uint256 timestamp);
+```
 
-- Oracle (BFF Relayer) присылает агрегированные голоса пользователей
-- `int128` кумулятивный скор (поддерживает отрицательные значения)
-- `postFeedbackBatch(agentId, scoreDelta, votersCount, metadata)` — один агент
-- `postFeedbackBatchMulti(agentIds[], scoreDeltas[], votersCounts[], metadata)` — массовый
-- Overflow detection + ротация oracle
+- **No storage writes for hash** — only `emit` event (extreme gas optimization)
+- **Counter only** — `agentCommitCount[agentId]++` for statistics
+- **Ownership check** — Only the owner of the SentinelIdentity NFT can commit
+- **Zero-hash protection** — Prevents accidental empty commits
 
-### 1.5 ERC-8004 IdentityRegistry.sol (175 строк)
+#### ReputationRegistry.sol — On-Chain Reputation Oracle
 
-Полная реализация стандарта ERC-8004 для AI-агентов:
+Batch-updatable reputation system:
 
-- ERC-721 + URIStorage (JSON metadata on IPFS)
-- **Soulbound** (трансферы заблокированы через `_update` override)
-- `registerAgent(owner, agentCardURI)` — кто угодно может зарегистрировать
-- Agent Card JSON спецификация: name, description, capabilities[], endpoints{}, paymentAddresses{}
+```solidity
+function batchUpdateScores(uint256[] calldata agentIds, int128[] calldata deltas) external;
+function getScore(uint256 agentId) external view returns (int256);
+```
 
-### 1.6 ERC-8004 ValidationRegistry.sol (309 строк)
+- **Oracle-pattern** — BFF aggregates HITL votes from Redis, batches on-chain
+- **int128 deltas** — Supports both positive and negative score updates
+- **Multi-agent batch** — Single transaction updates multiple agents (gas efficient)
 
-Криптографическая валидация агентов TEE-оракулами:
+#### DEX Adapters
 
-- `requestValidation` — запрос аудита агента
-- `submitValidation` — валидатор отправляет результат + SGX attestation
-- Один валидатор = один ответ на запрос
-- Трекинг approval rate
-- Off-chain flow: request → TEE oracle аудит → submit on-chain
+| Adapter | Protocol | Interface |
+|---------|----------|-----------|
+| `AgniAdapter.sol` | Agni Finance | UniswapV3 `exactInputSingle` |
+| `MerchantMoeAdapter.sol` | Merchant Moe | LBRouter `swapExactTokensForTokens` |
 
-### 1.7 Адаптеры DEX
+Both implement the unified `IDexRouter` interface:
+```solidity
+interface IDexRouter {
+    function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minAmountOut, bytes calldata extraData) external returns (uint256 amountOut);
+}
+```
 
-**MerchantMoeAdapter.sol (125 строк):**
-- UniV2-style bin liquidity (Merchant Moe)
-- `swapExactTokensForTokens` wrapper
-- Pull/push pattern (токены через адаптер)
+#### Libraries
 
-**AgniAdapter.sol (130 строк):**
-- UniV3-style concentrated liquidity (Agni Finance)
-- `exactInputSingle` wrapper
-- Параметры: fee tier, deadline, sqrtPriceLimitX96
-
-### 1.8 Библиотеки и интерфейсы
-
-- `TransientReentrancyGuard.sol` — EIP-1153 transient storage guard (100 gas vs 5000)
-- `IDexRouter.sol` — унифицированный DEX swap interface
-- `IFlashBorrower.sol` — INIT Capital callback interface
-- `IINITCore.sol` — INIT Capital flash borrow initiation
-
-### 1.9 Deploy Script (script/Deploy.s.sol, 160 строк)
-
-- Деплоит все 6 контрактов в правильном порядке зависимостей
-- Post-deploy: регистрация TEE агента, добавление валидатора, инъекция адресов
-- Выводит deployment summary со всеми адресами
-
-### 1.10 Тесты
-
-| Файл | Тесты | Описание |
-|------|-------|----------|
-| ActiveSentinel.t.sol | Unit tests | Flash arb execution |
-| ActiveSentinelSecurity.t.sol | Security (885 строк) | Reentrancy, signature replay, unauthorized access |
-| DexAdapters.t.sol | Integration | Adapter swap tests с моками |
-| SentinelModule1.t.sol | Unit tests | Identity + AlphaAuditor |
+- **TransientReentrancyGuard.sol** — TSTORE/TLOAD based reentrancy protection (EIP-1153). 98% gas reduction vs traditional SSTORE-based guards (100 gas vs 5000 gas per check).
 
 ---
 
-## Модуль 2: TEE Agent
+### 2. TEE Agent (Phala DStack CVM)
 
-**Путь:** `agent-tee/`  
-**Язык:** TypeScript  
-**Runtime:** Phala DStack (TEE — Trusted Execution Environment)  
-**Файлов:** 19 .ts  
-**Тесты:** 22 (сломаны — нужен рефакторинг yieldArchitect)
+Located in `agent-tee/`. Runs inside a Trusted Execution Environment (Phala Network Confidential Virtual Machine).
 
-### 2.1 main.ts — Главный оркестратор
-
-Polling-based pipeline, работающий внутри TEE:
+#### Core Architecture
 
 ```
-1. Nansen API → Свежие транзакции smart money кошельков
-2. Bloom Filter → Дедупликация (O(1), false positive rate настраиваемый)
-3. txEnrichment → Обогащение (symbols, USD values, labels)
-4. clusteringEngine → Группировка похожих транзакций
-5. llmEngine → GPT-4 анализ, conviction scoring
-6. proposalPublisher → Публикация в Telegram (через Redis pub/sub)
-7. executor → On-chain исполнение одобренных предложений
+main.ts (Entry Point)
+    │
+    ├── NansenMCPClient → Fetch smart money signals
+    │       │
+    │       ▼
+    ├── ClusteringEngine → Discover related wallets
+    │       │
+    │       ▼
+    ├── YieldArchitect → Generate EIP-712 signed proposal
+    │       │
+    │       ▼
+    ├── SentinelExecutor → commitInsight() on-chain (BLOCKING)
+    │       │
+    │       ▼
+    ├── CircuitBreaker → Validate market conditions
+    │       │
+    │       ▼
+    └── ProposalPublisher → XADD to Redis Stream
 ```
 
-Включает:
-- Health check HTTP server
-- Graceful shutdown (SIGTERM/SIGINT)
-- Session key rotation schedule
-- Error recovery и retry
+#### Pipeline Invariant (Critical)
 
-### 2.2 executor.ts — On-chain исполнение
+```
+generateProposal → commitProofOfAlpha → [CircuitBreaker] → publish
+                          │
+                    MUST succeed before
+                    publish is allowed
+```
 
-- viem + ZeroDev (ERC-4337 Account Abstraction)
-- Построение EIP-712 signed ArbParams
-- Flash arbitrage транзакции в ActiveSentinel
-- Session keys для gasless execution
-- Retry logic, nonce management
-- MEV protection (Flashbots-style bundle submission)
+The on-chain commitment is **BLOCKING** — if the `commitInsight()` transaction fails, the proposal is NEVER published to Redis. This ensures every published proposal has a corresponding on-chain proof.
 
-### 2.3 types/index.ts — Типы
+#### Services
+
+| Service | File | Purpose |
+|---------|------|---------|
+| **NansenMCPClient** | `nansenClient.ts` | Fetches smart money wallet activity from Nansen MCP API. Filters by chain (Mantle), minimum transaction value, and wallet labels. |
+| **ClusteringEngine** | `strategies/clusteringEngine.ts` | Auto-discovers related wallets via transfer heuristics (shared gas sources, coordinated timing, common token interactions). Groups into clusters for signal amplification. |
+| **YieldArchitect** | `strategies/yieldArchitect.ts` | Generates flash arbitrage proposals. Computes insightHash via `keccak256(encodePacked([address, string, uint256, uint256]))`. Signs with EIP-712 typed data. |
+| **LLMEngine** | `strategies/llmEngine.ts` | GPT-4 reasoning engine. Interprets Nansen signals, scores conviction (0-1), recommends action (FOLLOW/FADE/IGNORE), assesses risk (1-10). |
+| **SentinelExecutor** | `executor.ts` | Commits insightHash to AlphaAuditor on-chain. Handles gas estimation, nonce management, and transaction confirmation. |
+| **CircuitBreaker** | `services/circuitBreaker.ts` | 3-check safety halt system. See [Circuit Breaker Safety System](#circuit-breaker-safety-system). |
+| **ProposalPublisher** | `services/proposalPublisher.ts` | Publishes finalized proposals to Redis Stream `agent_insights` via XADD. |
+| **BloomFilter** | `services/bloomFilter.ts` | Probabilistic noise wallet filtering. Configurable false positive rate. |
+| **DynamicWatchlist** | `services/dynamicWatchlist.ts` | Redis SMEMBERS-based wallet tracking. Epoch-rate-limited updates. |
+| **MEVProtection** | `services/mevProtection.ts` | Private mempool routing, flashbots-style bundle submission. |
+| **SessionKeyRotator** | `services/sessionKeyRotator.ts` | ZeroDev session key rotation for Account Abstraction (future AA mode). |
+| **RemoteAttestation** | `services/remoteAttestation.ts` | Phala TEE remote attestation proof generation. |
+| **RateLimiter** | `services/rateLimiter.ts` | Request rate limiting for external API calls. |
+| **TxEnrichment** | `services/txEnrichment.ts` | Transaction metadata enrichment (labels, protocol identification). |
+
+#### Security Model (TEE)
+
+- **Private key generated IN-MEMORY at each boot** — never persisted to disk
+- **Only public address is exported** — for SentinelIdentity registration
+- **Remote attestation** — Phala DStack provides cryptographic proof of code integrity
+- **Sealed thresholds** — CircuitBreaker constants are compiled into the TEE image, immutable at runtime
+
+#### Insight Schema (LLMInsight)
 
 ```typescript
-interface EnrichedTransaction {
-  hash: string;
-  from: string;
-  to: string;
-  walletLabel: string;        // e.g. "Paradigm", "Jump Trading"
-  tokenIn: TokenInfo;
-  tokenOut: TokenInfo;
-  usdValue: number;
-  txType: 'swap' | 'stake' | 'unstake' | 'bridge';
-  rwaClassification?: string;
-  timestamp: number;
-}
-
-interface Cluster {
-  id: string;
-  transactions: EnrichedTransaction[];
-  similarity: number;
-  dominantToken: string;
-  dominantDirection: 'buy' | 'sell';
-}
-
 interface LLMInsight {
-  convictionScore: number;    // 0-1
-  reasoning: string;
-  proposedAction: 'long' | 'short' | 'yield' | 'skip';
-  targetAsset: string;
-  suggestedSize: number;
-  reasoningHash: string;      // keccak256 для on-chain
-}
-
-interface Proposal {
-  id: string;
-  insight: LLMInsight;
-  status: 'pending' | 'approved' | 'rejected' | 'expired' | 'executed';
-  createdAt: number;
-  deadline: number;
-  arbParams?: ArbParams;
+    convictionScore: number;       // 0.0 - 1.0
+    reasoning: string;             // Human-readable interpretation
+    proposedAction: {
+        asset: Address;            // Token contract address
+        assetSymbol: string;       // e.g. "WMNT"
+        action: "BUY" | "SELL";
+        recommendedAmount: string; // Wei amount as string
+    };
+    nonce: number;                 // Replay protection
+    deadline: number;              // Unix timestamp (TTL)
+    reasoningHash: Hex;            // keccak256 of reasoning content
+    teeSignerAddress: Address;     // TEE agent's ephemeral address
+    priceAtGeneration: number;     // Asset price at insight time
+    maxSlippagePct: number;        // Maximum acceptable slippage
+    generatedAt: number;           // Unix timestamp
+    signature: Hex;                // EIP-712 signature
+    insightHash: Hex;              // keccak256 commitment hash
+    commitTxHash: Hex;             // AlphaAuditor transaction hash
 }
 ```
-
-### 2.4 Стратегии
-
-**clusteringEngine.ts:**
-- Группировка по token-pair similarity
-- Temporal proximity (в пределах time windows)
-- Wallet label correlation (один label = выше вес)
-- Настраиваемые thresholds
-- Выход: ranked clusters для LLM
-
-**yieldArchitect.ts:**
-- RWA (Real World Asset) yield стратегия
-- Анализ mETH, cmETH, USDY позиций на Mantle
-- Оптимальная аллокация: staking / restaking / T-bill yield
-- Risk scoring по типу актива
-- Генерация yield proposals с APY estimates
-
-**llmEngine.ts:**
-- OpenAI GPT-4 с structured prompts
-- Вход: clustered transactions + wallet labels
-- Выход: conviction scores (0-1), directional signals, reasoning
-- Chain-of-thought prompt engineering
-- Хеширование reasoning для on-chain прозрачности
-
-### 2.5 Сервисы
-
-| Сервис | Описание |
-|--------|----------|
-| `nansenClient.ts` | Nansen API — smart money транзакции, pagination, rate limiting |
-| `dynamicWatchlist.ts` | Автоматическое управление watchlist кошельков (add/remove по performance) |
-| `proposalPublisher.ts` | Redis pub/sub → Telegram bot, tracking статуса proposals |
-| `rateLimiter.ts` | Token bucket rate limiter (per-wallet, per-API), Redis-backed |
-| `sessionKeyRotator.ts` | ZeroDev session key lifecycle (generate, rotate, register) |
-| `mevProtection.ts` | Flashbots bundle submission, private mempool, MEV-aware slippage |
-| `remoteAttestation.ts` | TEE attestation quotes (SGX), verify peers, publish on-chain |
-| `bloomFilter.ts` | Probabilistic dedup (O(1)), auto-rotation per epoch, Redis-persisted |
-| `byrealClient.ts` | Alternative data: on-chain activity metrics, whale alerts |
-| `txEnrichment.ts` | Token resolution, USD values, RWA matching, tx type labeling |
-
-### 2.6 Конфигурация
-
-**rwaRegistry.ts** — Статический реестр RWA на Mantle:
-
-| Актив | Протокол | APY | Описание |
-|-------|----------|-----|----------|
-| USDY | Ondo Finance | ~5% | Tokenized T-bills |
-| mETH | Mantle Staked Ether | ~3.5% | Liquid staking |
-| cmETH | Mantle Liquid Restaking | ~6% | Restaking token |
-
-### 2.7 Скрипты
-
-**generateAgentCard.ts:**
-- Генерирует ERC-8004 Agent Card JSON
-- Загружает на IPFS (Pinata/web3.storage)
-- Возвращает CID для on-chain регистрации
 
 ---
 
-## Модуль 3: BFF Server
+### 3. Backend-for-Frontend (BFF) — Hono
 
-**Путь:** `bff/`  
-**Фреймворк:** Hono ^4.4  
-**Порт:** 3001  
-**Тесты:** 16/16 passing
+Located in `bff/`. HTTP + WebSocket server bridging TEE agent and frontend.
 
-### 3.1 index.ts — API сервер
+#### API Endpoints
 
-**Endpoints:**
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `GET` | `/api/proposal/:id` | HMAC | Fetch proposal with optimistic lock + staleness check + EIP-712 payload |
+| `POST` | `/api/proposal/:id/consume` | HMAC | Burns proposal nullifier (one-time use, prevents double-execution) |
+| `POST` | `/api/proposal/:id/simulate` | HMAC | Dry-run eth_call simulation (gas estimation + revert check) |
+| `GET` | `/api/health` | None | Redis + RPC connectivity health check |
+| `WS` | `/ws` | JWT | Real-time proposal stream (Redis Streams → WebSocket) |
 
-| Метод | Путь | Описание | Auth |
-|-------|------|----------|------|
-| GET | `/api/proposal/:id` | Получить proposal + EIP-712 payload | HMAC |
-| POST | `/api/proposal/:id/consume` | Сжечь nullifier (double-spend protection) | HMAC |
-| POST | `/api/proposal/:id/simulate` | Dry-run eth_call симуляция | HMAC |
-| GET | `/api/health` | Redis + RPC health check | Public |
+#### WebSocket Server (`wssBroadcaster.ts`)
 
-**Middleware:**
-- CORS (ограничен Telegram origins)
-- Logger
-- HMAC verification на всех `/api/proposal/*` маршрутах
+Architecture:
+1. **HTTP Upgrade** — JWT token extracted from `Authorization` header or `?token=` query param
+2. **JWT Verification** — `jsonwebtoken.verify(token, HMAC_SECRET)`
+3. **Redis XREAD BLOCK** — Dedicated Redis connection blocks on `agent_insights` stream
+4. **Broadcast** — Every new stream entry is JSON-parsed and broadcast to all connected clients
+5. **Heartbeat** — Ping every 30s, kill zombies (no pong response = terminated)
+6. **Graceful shutdown** — Abort XREAD loop, clear interval, close all sockets
 
-**Ключевой принцип:** BFF НЕ хранит приватных ключей (кроме relayer для reputation batching).
+#### Services
 
-### 3.2 proposalService.ts — Redis-backed proposal store
+| Service | Purpose |
+|---------|---------|
+| `proposalService.ts` | Redis SETNX locking (60s TTL), HMAC-SHA256 verification (timing-safe), nullifier consumption |
+| `onChainOracle.ts` | Price staleness check via viem RPC calls, eth_call simulation for dry-runs |
+| `reputationBatcher.ts` | Aggregates HITL votes from Redis, batches into ReputationRegistry.batchUpdateScores() |
+| `wssBroadcaster.ts` | WebSocket server + Redis Streams consumer (see above) |
 
-**Функции:**
+#### Middleware Stack
 
-| Функция | Описание |
-|---------|----------|
-| `verifyHmac(proposalId, signature)` | Timing-safe HMAC-SHA256 проверка |
-| `computeHmac(data)` | Генерация HMAC подписи |
-| `getAndLockProposal(proposalId)` | Fetch + deadline check + SETNX lock (60s TTL) + nullifier check |
-| `consumeProposal(proposalId)` | Atomic pipeline: set nullifier → update status → remove lock → set 7d TTL |
-| `redisHealthCheck()` | Ping |
-| `shutdownRedis()` | Graceful close |
-
-**Redis Key Schema:**
-```
-proposal:{id}              — JSON данные proposal
-proposal_status:{id}       — FSM статус (pending/approved/consumed/expired)
-proposal_lock:{id}         — Optimistic lock (SETNX, TTL 60s)
-nullifier:{reasoningHash}  — Double-spend protection (permanent)
-```
-
-**StoredProposal model:**
-```typescript
-interface StoredProposal {
-  asset: string;
-  assetSymbol: string;
-  action: string;
-  recommendedAmount: string;
-  nonce: number;
-  deadline: number;
-  reasoningHash: string;
-  signature: string;
-  signerAddress: string;
-  generatedAt: number;
-  maxSlippageBps: number;
-  priceAtGeneration: string;
-}
-```
-
-### 3.3 onChainOracle.ts — On-chain ценовой оракул
-
-**Multi-RPC стратегия:** 3-endpoint fallback с auto-ranking по latency:
-1. Primary RPC (rpc.mantle.xyz)
-2. Blast RPC (mantle-mainnet.blastapi.io)
-3. DRPC (mantle.drpc.org)
-
-**Функции:**
-
-| Функция | Описание |
-|---------|----------|
-| `checkPriceStaleness(...)` | Full price check: UniV3 slot0 / UniV2 getReserves + TWAP + Pyth cross-validation |
-| `calculateTWAP(pairAddress)` | UniV3 observe() TWAP с настраиваемыми observation points |
-| `getPythPrice(feedId, maxAge)` | Pyth Network oracle с fallback на getPriceUnsafe |
-| `simulateTransaction(to, data)` | eth_call dry-run |
-| `rpcHealthCheck()` | Block number + Pyth availability |
-
-**Pyth Price Feeds:**
-- ETH/USD
-- USDC/USD
-- USDT/USD
-- MNT/USD
-- WETH/USD
-
-**Детекция манипуляций:** spot vs TWAP отклонение > 500bps (5%) → `isManipulated: true`
-
-### 3.4 reputationBatcher.ts — Reputation batch daemon
-
-Фоновый процесс (каждые 5 минут):
-
-1. SCAN Redis по паттерну `agent_feedback_*`
-2. Atomic GETDEL через Lua скрипт (предотвращение потери голосов)
-3. Chunk по MAX_AGENTS_PER_BATCH=50 (gas limit safety)
-4. Submit `postFeedbackBatch` / `postFeedbackBatchMulti` в ReputationRegistry
-5. Retry: exponential backoff 1s→2s→4s, max 3 attempts
-
-**Lazy-init:** не крашится без RELAYER_PRIVATE_KEY (просто не запускается).
-
-### 3.5 Тесты (api.test.ts)
-
-| Suite | Проверки |
-|-------|----------|
-| HMAC Verification | Valid passes, tampered fails, empty rejected, timing-safe |
-| Staleness Detection | Within tolerance, beyond tolerance, zero price skip |
-| Deadline Enforcement | Expired → 410, valid → allow |
-| Status FSM | pending-only fetch, consumable states |
-| Double-Spend Prevention | Consume changes state, second consume rejected |
-| Input Sanitization | UUID format, HMAC hex format |
-| Frontend Oracle Spoofing | Price comes from server, NOT client |
+1. **CORS** — Allows origins: Telegram WebView, Vercel frontend, Cloudflare tunnel
+2. **HMAC Verification** — Timing-safe comparison of `x-hmac-signature` header vs computed HMAC-SHA256(proposalId, secret)
+3. **Rate Limiting** — Per-IP request throttling (implicit via infrastructure)
 
 ---
 
-## Модуль 4: Telegram Mini App
+### 4. Frontend PWA (Vite + React)
 
-**Путь:** `frontend/`  
-**Фреймворк:** React 18 + Vite  
-**Деплой:** Vercel (frontend-alphaflow-app.vercel.app)  
-**Файлов:** 7 .ts/.tsx
+Located in `frontend/`. Cyberpunk terminal-themed Progressive Web App.
 
-### 4.1 main.tsx + App.tsx — Entry point
+#### Tech Stack
 
-- Telegram WebApp инициализация (тема, viewport, кнопка "Назад")
-- Authentication flow (Telegram initData verification)
-- TonConnectUIProvider wrapping
-- Error boundaries + loading states
+| Layer | Technology | Version |
+|-------|-----------|---------|
+| Build | Vite | 5.4 |
+| UI | React | 18.3 |
+| Styling | TailwindCSS | 3.4 |
+| Web3 | wagmi + viem | 2.14 / 2.21 |
+| Wallet | RainbowKit | 2.2 |
+| Auth | SIWE (EIP-4361) | 3.0 |
+| State | @tanstack/react-query | 5.60 |
+| Language | TypeScript | 5.5 |
 
-### 4.2 InvestFlowApp.tsx — Основной UI
+#### Provider Tree
 
-Полный инвестиционный интерфейс:
+```
+React.StrictMode
+  └── WagmiProvider (Mantle mainnet, chainId 5000)
+      └── QueryClientProvider (staleTime: 5s, retry: 2)
+          └── RainbowKitProvider (darkTheme, accent: #00f3ff)
+              └── App (Authentication Gate)
+                  └── WebSocketProvider (JWT-gated singleton)
+                      └── DashboardLayout (CSS Grid 12-col)
+```
 
-- **Portfolio dashboard** — балансы, PnL
-- **Proposal cards** — approve/reject кнопки
-- **Real-time updates** через WebSocket
-- **Deposit/Withdraw flows** — подпись через WebAuthn
-- **Agent reputation** — визуализация скора
-- **Strategy selection** — conservative / balanced / aggressive
+#### Authentication Flow (SIWE)
 
-### 4.3 bffClient.ts — API клиент
+```
+1. User connects wallet (MetaMask/Rabby/WalletConnect)
+           │
+           ▼
+2. Construct EIP-4361 message:
+   "alphaflow-suite wants you to sign in with your Ethereum account..."
+   - Domain, URI, Chain ID (5000), Nonce (from BFF), IssuedAt
+           │
+           ▼
+3. User signs message → signature
+           │
+           ▼
+4. POST /auth/verify { message, signature }
+           │
+           ▼
+5. BFF verifies SIWE → issues JWT (HMAC-SHA256, 24h expiry)
+           │
+           ▼
+6. JWT stored in localStorage("alphaflow_jwt")
+           │
+           ▼
+7. WebSocket connects with JWT → real-time stream begins
+```
+
+#### Dashboard Components
+
+**Layout (12-column CSS Grid):**
+```
+┌────────────────────────────────────────────────┐
+│ TopNav (full width) — RainbowKit ConnectButton │
+├──────────────────────────────┬─────────────────┤
+│ LiveAgentConsole (8 cols)    │ ERC8004Explorer │
+│ (Real-time scrolling log)    │ (4 cols)        │
+│                              │ Agent Cards     │
+├──────────────────────────────┤                 │
+│ ProofOfAlpha (8 cols)        │                 │
+│ (On-chain hash verification) │                 │
+├──────────────────────────────┼─────────────────┤
+│ ReputationHeatmap (8 cols)   │ RWARiskPanel    │
+│ (8x3 epoch score grid)      │ (4 cols)        │
+│                              ├─────────────────┤
+│                              │ MEVMetrics      │
+│                              │ (4 cols)        │
+└──────────────────────────────┴─────────────────┘
+```
+
+| Component | Description |
+|-----------|-------------|
+| **TopNav** | Header with "AlphaFlow" branding + RainbowKit ConnectButton (shows balance, chain, address) |
+| **LiveAgentConsole** | Real-time scrolling terminal feed. Displays timestamped insights from WebSocket, color-coded by type: ALERT=magenta, ARBITRAGE=green, SIGNAL=cyan. Keeps last 100 entries. Auto-scrolls to bottom. |
+| **ProofOfAlpha** | Trustless on-chain verification widget. Computes local keccak256 of displayed insight, queries AlphaAuditor event logs, compares hashes. Status: `HARDWARE VERIFIED` / `UNVERIFIED` / `VERIFYING` / `AUDITOR N/A` |
+| **ERC8004Explorer** | Agent identity card browser. Displays registered agents from SentinelIdentity, their metadata URIs, commit counts, and reputation scores. |
+| **ReputationHeatmap** | 8x3 grid visualization of agent reputation scores across epochs. Color intensity represents score magnitude. |
+| **RWARiskPanel** | Real-time risk indicators with progress bars: Liquidity Risk, Slippage Risk, MEV Exposure, Oracle Deviation. Each rated LOW/MED/HIGH with color coding. |
+| **MEVMetrics** | Gas efficiency comparison: Traditional reentrancy guard (5000 gas) vs AlphaFlow EIP-1153 TSTORE (100 gas) = **98% reduction**. Shows private mempool routing status. |
+| **ProposalView** | Trade execution interface. Displays proposal details, user signs EIP-712 typed data, calls `executeFlashArbitrage()`. Links to MantleScan for confirmation. |
+
+#### WebSocket Provider
 
 ```typescript
-// REST API calls к BFF backend
-GET  /proposals      — список активных proposals
-GET  /portfolio      — текущий портфель
-POST /approve/:id    — одобрить proposal
-POST /reject/:id     — отклонить proposal
-POST /deposit        — пополнить
-POST /withdraw       — вывести
+// Singleton connection with exponential backoff
+interface WebSocketContextValue {
+    isConnected: boolean;
+    latestInsight: AgentInsight | null;
+    reconnectAttempt: number;
+    reconnect: () => void;
+}
 
-// WebSocket для real-time notifications
-WS   /ws/proposals   — новые proposals в реальном времени
+// Reconnection: 1s → 2s → 4s → 8s → 16s (max 5 attempts)
+// Insight types: ARBITRAGE | SIGNAL | ALERT | HEARTBEAT
 ```
 
-- Telegram initData в auth headers
-- Retry с exponential backoff
+#### Styling Theme (Cyberpunk Terminal)
 
-### 4.4 useWebAuthn.ts — WebAuthn hook
-
-React hook для работы с Passkeys:
-
-- **Registration flow** — создание credential (navigator.credentials.create)
-- **Authentication flow** — подпись challenge (navigator.credentials.get)
-- **Связь с ZeroDev Kernel** — on-chain validation через Passkey Validator
-- Транзакции без приватного ключа в браузере
-
-### 4.5 vite.config.ts
-
-- React plugin
-- HTTPS dev server (для Telegram WebApp тестирования)
-- Proxy к BFF backend
+```javascript
+// tailwind.config.js
+colors: {
+    bgDark: '#0D0D0D',      // Near-black background
+    neonCyan: '#00f3ff',     // Primary accent (borders, text)
+    neonMagenta: '#ff003c',  // Alert/error accent
+    terminalGreen: '#00ff41' // Success/active indicator
+}
+// Font: Fira Code (monospace)
+// CRT scanline overlay: 4px animated gradient line, 4s sweep cycle
+// Panels: backdrop-blur with neonCyan border glow
+```
 
 ---
 
-## Модуль 5: DevOps / Telegram Bot
+## Data Flow & Pipeline
 
-**Путь:** `devops/`  
-**Фреймворк:** Grammy (Telegram Bot API)  
-**Файлов:** 3 .ts
+### Complete Transaction Lifecycle
 
-### 5.1 index.ts — Bot logic
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        FULL E2E PIPELINE                                     │
+│                                                                             │
+│  1. SIGNAL DETECTION                                                        │
+│     NansenMCP → Smart Money wallet activity on Mantle                       │
+│     ClusteringEngine → Discovers 3 related wallets (transfer heuristics)    │
+│                                                                             │
+│  2. INSIGHT GENERATION                                                      │
+│     LLMEngine (GPT-4) → Interprets cluster activity                        │
+│     Output: { confidence: 0.87, action: "BUY", asset: "WMNT" }             │
+│                                                                             │
+│  3. HASH COMPUTATION                                                        │
+│     insightHash = keccak256(encodePacked(asset, action, amount, timestamp)) │
+│     reasoningHash = keccak256(encodePacked(interpretation, confidence, ...)) │
+│                                                                             │
+│  4. ON-CHAIN COMMITMENT (BLOCKING)                                          │
+│     AlphaAuditor.commitInsight(agentId=1, insightHash)                      │
+│     → Event: InsightCommitted(1, insightHash, block.timestamp)              │
+│     → agentCommitCount[1]++                                                 │
+│                                                                             │
+│  5. CIRCUIT BREAKER VALIDATION                                              │
+│     ✓ Slippage < 3%                                                        │
+│     ✓ Gas < 1.5x median                                                    │
+│     ✓ Oracle deviation < 2%                                                │
+│                                                                             │
+│  6. REDIS PUBLISH                                                           │
+│     XADD agent_insights * payload {JSON LLMInsight}                         │
+│                                                                             │
+│  7. BFF BROADCAST                                                           │
+│     XREAD BLOCK → parse → broadcast to all WebSocket clients                │
+│                                                                             │
+│  8. FRONTEND DISPLAY                                                        │
+│     LiveAgentConsole shows insight in real-time                              │
+│     ProofOfAlpha verifies local hash vs AlphaAuditor event logs             │
+│     Status: HARDWARE VERIFIED ✓                                             │
+│                                                                             │
+│  9. USER EXECUTION (Optional)                                               │
+│     User clicks "Execute" → signs EIP-712 → ActiveSentinel tx              │
+│     → Flash borrow → swap → swap → repay → profit                          │
+│                                                                             │
+│ 10. REPUTATION UPDATE                                                       │
+│     BFF aggregates outcome → ReputationRegistry.batchUpdateScores()         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-Telegram bot для HITL (Human-in-the-Loop) workflow:
+### Redis Streams Schema
 
-- Подписка на Redis pub/sub (канал proposals)
-- Форматирование и отправка proposals в admin чат
-- Inline keyboard: [✅ Approve] [❌ Reject]
-- Callback query handlers для кнопок
-- Уведомление agent-tee о решении
+```
+Stream: agent_insights
+Entry: { payload: JSON string }
 
-**Admin команды:**
-- `/status` — текущее состояние системы
-- `/portfolio` — портфель
-- `/pause` — приостановить агента
-- `/resume` — возобновить
-
-### 5.2 proposalStore.ts — Redis proposal storage
-
-- CRUD для proposals
-- TTL-based expiry (автоматическое истечение)
-- Pub/sub listener для новых proposals
-- Status tracking: pending → approved/rejected/expired
-
-### 5.3 config.ts — Конфигурация
-
-- BOT_TOKEN, REDIS_URL, ADMIN_CHAT_IDS, RPC_URL
-- Валидация на старте
-- Type-safe config export
+Payload fields:
+- convictionScore (number)
+- reasoning (string)
+- proposedAction.asset (address)
+- proposedAction.assetSymbol (string)
+- proposedAction.action ("BUY" | "SELL")
+- proposedAction.recommendedAmount (string, wei)
+- nonce (number)
+- deadline (number, unix timestamp)
+- reasoningHash (hex)
+- teeSignerAddress (address)
+- priceAtGeneration (number)
+- maxSlippagePct (number)
+- generatedAt (number, unix timestamp)
+- signature (hex, EIP-712)
+- insightHash (hex, keccak256)
+- commitTxHash (hex, AlphaAuditor tx)
+```
 
 ---
 
-## Инфраструктура и деплой
+## Security Model
 
-### docker-compose.yml
+| Layer | Mechanism | Description |
+|-------|-----------|-------------|
+| **Smart Contract** | Hybrid Reentrancy Guard | TSTORE (EIP-1153) + SSTORE dual-layer protection |
+| **Smart Contract** | EIP-712 Signatures | Only registered TEE signer can authorize flash arb |
+| **Smart Contract** | Token Whitelist | Prevents ERC-777 transfer hook exploits |
+| **Smart Contract** | Nonce Replay Protection | Each nonce used exactly once |
+| **Smart Contract** | Flash Loan Context (H-08) | Validates msg.sender == INIT Core + initiator == self |
+| **Smart Contract** | Deadline Enforcement | Prevents stale transaction execution |
+| **TEE Agent** | Phala DStack CVM | Code runs in hardware-isolated enclave |
+| **TEE Agent** | Ephemeral Keys | Private key generated in-memory, never persisted |
+| **TEE Agent** | Remote Attestation | Cryptographic proof of code integrity |
+| **TEE Agent** | Circuit Breaker | 3-check safety halt (slippage, gas, oracle) |
+| **TEE Agent** | Sealed Thresholds | Constants compiled into TEE image, immutable |
+| **BFF** | HMAC-SHA256 | Timing-safe verification of all proposal endpoints |
+| **BFF** | JWT (HS256) | WebSocket authentication token (24h expiry) |
+| **BFF** | Optimistic Locking | Redis SETNX prevents concurrent proposal access |
+| **BFF** | Nullifier Pattern | One-time proposal consumption (prevents double-spend) |
+| **Frontend** | SIWE (EIP-4361) | Sign-In With Ethereum — wallet-based authentication |
+| **Frontend** | EOA User-Pays | User explicitly signs and pays gas (no custodial risk) |
+| **Frontend** | No Secrets | Frontend holds zero private keys or API secrets |
+| **Infrastructure** | Redis AUTH | Password-protected Redis with AOF persistence |
+| **Infrastructure** | CORS Whitelist | Restricted to known frontend origins |
+
+---
+
+## Deployment Architecture
+
+### Docker Compose (Development/Staging)
 
 ```yaml
 services:
-  redis:        # Redis 7 Alpine, AOF persistence, port 6379
-  bff:          # Hono API, port 3001, depends on redis
-  tg-bot:       # Telegraf/Grammy bot, depends on redis
-  agent-tee-dev: # Dev profile only (TEE agent)
-  anvil:        # Test profile only (Mantle fork for local testing)
+  redis:        # Redis 7 Alpine, AOF persistence, 512MB maxmemory, password auth
+  bff:          # Hono server, port 3001, depends on redis
+  agent-tee-dev: # TEE agent (dev profile), port 8080
+  anvil:        # Mantle fork for testing (test profile), port 8545
 ```
 
-### Текущий деплой (Production)
+### Production Deployment
 
-| Компонент | Где | Статус |
-|-----------|-----|--------|
-| Redis | GCP VM (нативно) | ✅ Running |
-| BFF | GCP VM + Cloudflare Tunnel | ✅ Running |
-| Telegram Bot | GCP VM (нативно) | ✅ Configured |
-| Frontend (TMA) | Vercel | ✅ Deployed |
-| Smart Contracts | Mantle Network | ✅ Deployed |
-| Agent TEE | Phala DStack (будет) | ⏳ Pending |
-| Docker | Не установлен на хосте | ❌ N/A |
+| Component | Platform | Details |
+|-----------|----------|---------|
+| Smart Contracts | Mantle Mainnet | Deployed via Foundry `forge script` |
+| TEE Agent | Phala Network | DStack CVM (Confidential VM) |
+| BFF | GCP Compute | Instance `instance-20260330-115005` (IP: 146.148.57.175) |
+| Frontend | Vercel | SPA with security headers + cache |
+| Redis | GCP (same instance) | Redis 7, localhost:6379 |
 
-### GCP Instance
+### Frontend Deployment (Vercel)
 
-- Name: instance-20260330-115005
-- IP: 146.148.57.175
-- Project: aeroport-491811
-- OS: Debian (Linux 6.1.0-44-cloud-amd64)
-
----
-
-## Безопасность
-
-### Модель угроз и защита
-
-| Угроза | Защита |
-|--------|--------|
-| Replay attack | Nonce в ArbParams + on-chain tracking |
-| Reentrancy | Hybrid guard (TSTORE + SSTORE) |
-| Price manipulation | TWAP + Pyth cross-validation + 5% deviation flag |
-| Double-spend proposal | Nullifier-based protection (permanent Redis key) |
-| Unauthorized execution | EIP-712 signature от TEE agent only |
-| Frontend spoofing | Price ALWAYS from server oracle, not client |
-| HMAC tampering | Timing-safe comparison (crypto.timingSafeEqual) |
-| Session key compromise | Auto-rotation, scoped permissions (only executeFlashArbitrage) |
-| Bot spam | Rate limiting per user/wallet/API |
-| TEE code tampering | Remote attestation (SGX quotes) + on-chain ValidationRegistry |
-| Token whitelist bypass | On-chain whitelist check in ActiveSentinel |
-| Optimistic lock race | Redis SETNX with TTL (atomic) |
-
-### Ключевые инварианты
-
-1. **BFF не хранит приватных ключей** (кроме relayer для reputation)
-2. **Только TEE agent может подписывать ArbParams** (EIP-712 ecrecover)
-3. **Каждый proposal может быть использован ровно один раз** (nullifier)
-4. **Цена ВСЕГДА проверяется server-side** (frontend не может подменить)
-5. **Deadline enforcement** — просроченные proposals = 410 Gone
-
----
-
-## Потоки данных (End-to-End)
-
-### Flow 1: Обнаружение альфы → Исполнение
-
-```
-Nansen API
-    │
-    ▼
-[agent-tee] Fetch smart money txs (polling every 30s)
-    │
-    ▼
-[Bloom Filter] Dedup (O(1) check, Redis-persisted)
-    │
-    ▼
-[txEnrichment] Resolve tokens, USD values, classify
-    │
-    ▼
-[clusteringEngine] Group by similarity, temporal proximity
-    │
-    ▼
-[llmEngine] GPT-4 analysis → conviction score + reasoning
-    │
-    ▼
-[proposalPublisher] → Redis pub/sub → channel "proposals"
-    │
-    ├──────────────────────────────────┐
-    ▼                                  ▼
-[devops/tg-bot]                   [frontend/TMA]
-    │ Inline keyboard                  │ Real-time WebSocket
-    │ [Approve] [Reject]               │ [Approve] [Reject]
-    │                                  │
-    └──────────────┬───────────────────┘
-                   │ Decision
-                   ▼
-[Redis] proposal_status → "approved"
-    │
-    ▼
-[agent-tee/executor]
-    │ Build EIP-712 ArbParams
-    │ Sign with TEE private key
-    ▼
-[bff] simulateTransaction (dry-run)
-    │
-    ▼ (if simulation OK)
-[ActiveSentinel.sol] executeFlashArbitrage
-    │ Flash borrow (INIT Capital)
-    │ Swap Route1 (Merchant Moe)
-    │ Swap Route2 (Agni)
-    │ Repay + profit
-    ▼
-[Result] Profit → ActiveSentinel contract balance
-```
-
-### Flow 2: HITL подтверждение через TMA
-
-```
-[TMA Frontend] User taps "Approve"
-    │
-    ▼
-[useWebAuthn] navigator.credentials.get() → signed challenge
-    │
-    ▼
-[bffClient] POST /api/proposal/:id/consume
-    │ Headers: { X-HMAC-Signature, X-Telegram-InitData }
-    ▼
-[BFF] verifyHmac → getAndLockProposal → checkPriceStaleness
-    │ SETNX lock (60s) + deadline check + nullifier check
-    │ Pyth + TWAP price validation
-    ▼
-[BFF] consumeProposal → atomic Redis pipeline
-    │ SET nullifier (permanent)
-    │ UPDATE status → "consumed"
-    │ DEL lock
-    │ EXPIRE data (7 days)
-    ▼
-[Response] { eip712Payload, signature } → TMA
-    │
-    ▼
-[ZeroDev Kernel] Submit UserOperation (gasless via Paymaster)
-    │ Passkey Validator verifies WebAuthn signature
-    ▼
-[Mantle Network] Transaction executed
-```
-
-### Flow 3: Reputation feedback loop
-
-```
-[TMA] User votes 👍/👎 on executed proposal
-    │
-    ▼
-[Redis] INCR/DECR agent_feedback_{agentId}
-    │
-    ▼ (every 5 minutes)
-[reputationBatcher] SCAN + Lua atomic GETDEL
-    │ Chunk by 50 agents max
-    ▼
-[ReputationRegistry.sol] postFeedbackBatchMulti(...)
-    │
-    ▼
-[On-chain] Cumulative score updated (int128)
+```json
+{
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }],
+  "headers": [{
+    "source": "/(.*)",
+    "headers": [
+      { "key": "X-Frame-Options", "value": "DENY" },
+      { "key": "X-Content-Type-Options", "value": "nosniff" },
+      { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" }
+    ]
+  }]
+}
 ```
 
 ---
 
-## Переменные окружения
+## On-Chain Contracts (Mantle Mainnet)
 
-### bff/.env
+| Contract | Address | Verified |
+|----------|---------|----------|
+| **SentinelIdentity** | `0xC4499035f68737c3d8a917A92bbFe043F4Ed10CC` | ✓ MantleScan |
+| **AlphaAuditor** | `0xbF073B94a020626258626918d82bce05DC5E2aE0` | ✓ MantleScan |
+| **ActiveSentinel** | `0xfC7069a9f7B6C4c0a5704b28FEF3e2E47e0017A8` | ✓ MantleScan |
 
-| Переменная | Описание |
-|-----------|----------|
-| PORT | Порт сервера (3001) |
-| REDIS_URL | Redis connection string |
-| HMAC_SECRET | Shared secret для HMAC подписей |
-| MANTLE_RPC_PRIMARY | Основной RPC endpoint |
-| MANTLE_RPC_BLAST | Fallback RPC (Blast) |
-| MANTLE_RPC_DRPC | Fallback RPC (DRPC) |
-| PYTH_CONTRACT_ADDRESS | Pyth oracle contract на Mantle |
-| RELAYER_PRIVATE_KEY | (optional) Ключ для reputation batching |
+### Protocol Addresses (Mantle Mainnet)
 
-### devops/.env
+| Protocol | Contract | Address |
+|----------|----------|---------|
+| INIT Capital | Core | `0x972bCB...` |
+| Merchant Moe | LBRouter | `0xeaEE7E...` |
+| Agni Finance | SwapRouter | `0x319B69...` |
+| WMNT | Wrapped MNT | `0x78c1b0C915c4FAA5FffA6CAbf0219DA63d7f4cb8` |
 
-| Переменная | Описание |
-|-----------|----------|
-| BOT_TOKEN | Telegram Bot API token |
-| TARGET_CHAT_ID | Admin chat ID для уведомлений |
-| BOT_USERNAME | @alphaflow_agent_bot |
-| TMA_URL | https://frontend-alphaflow-app.vercel.app |
-| REDIS_URL | Redis connection string |
-| HMAC_SECRET | Shared secret |
+### Deployment Script (`DeployMainnet.s.sol`)
 
-### agent-tee/.env (требуется создать)
-
-| Переменная | Описание |
-|-----------|----------|
-| NANSEN_API_KEY | Ключ Nansen API |
-| OPENAI_API_KEY | GPT-4 для LLM engine |
-| ZERODEV_PROJECT_ID | ZeroDev dashboard ID |
-| PRIVATE_KEY | TEE agent signing key |
-| REDIS_URL | Redis connection string |
-| MANTLE_RPC_URL | RPC endpoint |
-| HMAC_SECRET | Shared secret |
-
-### frontend/.env (требуется создать)
-
-| Переменная | Описание |
-|-----------|----------|
-| VITE_BFF_URL | URL BFF сервера |
-| VITE_WS_URL | WebSocket URL |
-| VITE_TELEGRAM_BOT_USERNAME | Для deep linking |
+Deployment order:
+1. Deploy `SentinelIdentity`
+2. Deploy `AlphaAuditor(sentinelIdentityAddress)`
+3. Call `sentinelIdentity.registerAgent(agentCardURI)` → tokenId = 1
+4. Deploy `ActiveSentinel(initCore, dexRouterA, dexRouterB, sentinelIdentity)`
+5. Call `activeSentinel.setIdentityRegistry(sentinelIdentityAddress)`
+6. Call `activeSentinel.setTeeAgent(teeAgentAddress)`
+7. Batch whitelist tokens (WMNT, USDC, USDT, WETH)
 
 ---
 
-## Статус и roadmap
+## E2E Qualification Test Results
 
-### Текущий статус (Май 2025)
+**Executed: 2026-06-04T19:15:06Z (Mantle Mainnet)**
 
-| Компонент | Статус | Покрытие |
-|-----------|--------|----------|
-| Smart Contracts | ✅ Complete | 57 tests, security audit-ready |
-| BFF Server | ✅ Complete | 16 tests, HMAC + oracle + batcher |
-| Frontend TMA | ✅ Complete | Deployed on Vercel |
-| Telegram Bot (HITL) | ✅ Complete | Redis pub/sub proven |
-| Agent TEE (core) | ⚠️ Partial | Pipeline works, tests broken |
-| ZeroDev Integration | ⏳ Pending | Waiting for credentials |
-| Phala DStack Deploy | ⏳ Pending | Code ready, needs attestation setup |
-| Circuit Breaker | ⏳ Planned | Emergency stop mechanism |
-| Formal Verification | ⏳ Planned | Certora/Halmos for contracts |
+```
+╔═══════════════════════════════════════════════════════════════════╗
+║          E2E QUALIFICATION TEST — FINAL REPORT                   ║
+╠═══════════════════════════════════════════════════════════════════╣
+║                                                                   ║
+║  ✓ Step 1: Insight Generated (WMNT BUY, confidence=0.87)         ║
+║  ✓ Step 2: keccak256 Hash Computed (Proof-of-Alpha)              ║
+║  ✓ Step 3: Circuit Breaker PASSED (slip/gas/oracle OK)           ║
+║  ✓ Step 4: commitInsight() TX Confirmed on Mantle Mainnet        ║
+║  ✓ Step 5: InsightCommitted Event Verified in Logs               ║
+║  ✓ Step 6: Proposal Published to Redis Stream                    ║
+║  ✓ Step 7: Redis Entry Integrity Verified                        ║
+║                                                                   ║
+║  PROOF-OF-ALPHA STATUS: ████ HARDWARE VERIFIED ████              ║
+║                                                                   ║
+╠═══════════════════════════════════════════════════════════════════╣
+║  Duration:     6.8s                                               ║
+║  Gas Spent:    0.0033 MNT (~$0.002)                               ║
+║  Block:        96235097                                           ║
+║  TX Hash:      0xedcfc7a7b1412efde2cfde1f29eef2bca6d37fe667f...  ║
+║  insightHash:  0x65c21abbdbacfb6ae1d9e90cd9f461ccf818e992d610...  ║
+║                                                                   ║
+║  MantleScan: https://mantlescan.xyz/tx/0xedcfc7a7b1412efde2cf... ║
+╚═══════════════════════════════════════════════════════════════════╝
+```
 
-### Следующие шаги
-
-1. **ZeroDev credentials** — dashboard.zerodev.app, Mantle chain
-2. **Real Passkey transactions** — end-to-end WebAuthn → on-chain
-3. **Fix agent-tee tests** — generateAggregatedProposal рефакторинг
-4. **Circuit Breaker** — emergency pause для всей системы
-5. **Formal verification** — математическое доказательство корректности контрактов
-6. **Phala DStack production deploy** — remote attestation в mainnet
+**Verification Links:**
+- Transaction: https://mantlescan.xyz/tx/0xedcfc7a7b1412efde2cfde1f29eef2bca6d37fe667f20dc77f00dd299ee44a08
+- AlphaAuditor Contract: https://mantlescan.xyz/address/0xbF073B94a020626258626918d82bce05DC5E2aE0
+- SentinelIdentity: https://mantlescan.xyz/address/0xC4499035f68737c3d8a917A92bbFe043F4Ed10CC
+- ActiveSentinel: https://mantlescan.xyz/address/0xfC7069a9f7B6C4c0a5704b28FEF3e2E47e0017A8
 
 ---
 
-## Структура репозитория
+## Configuration & Environment
+
+### BFF Environment (`.env`)
+
+```bash
+PORT=3001
+NODE_ENV=production
+REDIS_URL=redis://localhost:6379
+HMAC_SECRET=<shared-with-agent>              # HMAC-SHA256 signing key
+ALLOWED_ORIGINS=https://t.me,...             # CORS whitelist
+MANTLE_RPC_PRIMARY=https://rpc.mantle.xyz
+MANTLE_RPC_FALLBACK_1=https://mantle-mainnet.public.blastapi.io
+```
+
+### Agent TEE Environment
+
+```bash
+DEPLOYER_PRIVATE_KEY=0x...                   # TEE ephemeral signer (in-memory in prod)
+NANSEN_API_KEY=<key>                         # Nansen MCP access
+OPENAI_API_KEY=<key>                         # GPT-4 reasoning
+REDIS_URL=redis://localhost:6379
+MANTLE_RPC=https://rpc.mantle.xyz
+HMAC_SECRET=<shared-with-bff>
+```
+
+### Frontend Environment (`.env`)
+
+```bash
+VITE_BFF_WSS_URL=wss://your-bff-domain/ws
+VITE_BFF_HTTP_URL=https://your-bff-domain
+VITE_WC_PROJECT_ID=9add069a8830633afa75d8e490c3f246  # WalletConnect (Reown)
+```
+
+### Foundry Configuration (`foundry.toml`)
+
+```toml
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.24"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+
+[fuzz]
+runs = 1000
+
+[invariant]
+runs = 256
+depth = 50
+
+[rpc_endpoints]
+mantle_mainnet = "https://rpc.mantle.xyz"
+mantle_fork = "http://localhost:8545"
+
+[etherscan]
+mantle = { key = "${MANTLESCAN_API_KEY}", url = "https://api.mantlescan.xyz/api" }
+```
+
+---
+
+## Directory Structure
 
 ```
 alphaflow-suite/
-├── ARCHITECTURE.md          # Техническая архитектура (English)
-├── CONCEPT.md               # Концепция продукта (Russian)
-├── PROJECT.md               # Описание проекта (Russian)
-├── README.md                # Quick start (English)
-├── FULL_PROJECT_DESCRIPTION.md  # ЭТО ФАЙЛ
-├── docker-compose.yml       # Docker orchestration
-├── .env.example             # Шаблон переменных окружения
-│
-├── contracts/               # Solidity smart contracts (Foundry)
+├── .github/
+│   └── workflows/
+│       └── ci.yml                    # CI: forge test + vitest + docker + integration
+├── contracts/                        # Foundry project
 │   ├── foundry.toml
+│   ├── remappings.txt
 │   ├── src/
-│   │   ├── ActiveSentinel.sol
-│   │   ├── SentinelIdentity.sol
-│   │   ├── AlphaAuditor.sol
-│   │   ├── ReputationRegistry.sol
+│   │   ├── ActiveSentinel.sol        # Core flash arb engine (371 lines)
+│   │   ├── AlphaAuditor.sol          # Proof-of-Alpha registry (90 lines)
+│   │   ├── SentinelIdentity.sol      # ERC-8004 identity (118 lines)
+│   │   ├── ReputationRegistry.sol    # Reputation oracle
+│   │   ├── adapters/
+│   │   │   ├── AgniAdapter.sol       # Agni Finance (UniV3)
+│   │   │   └── MerchantMoeAdapter.sol # Merchant Moe (LBRouter)
 │   │   ├── erc8004/
 │   │   │   ├── IdentityRegistry.sol
 │   │   │   └── ValidationRegistry.sol
-│   │   ├── adapters/
-│   │   │   ├── MerchantMoeAdapter.sol
-│   │   │   └── AgniAdapter.sol
-│   │   ├── libraries/
-│   │   │   └── TransientReentrancyGuard.sol
-│   │   └── interfaces/
-│   │       ├── IDexRouter.sol
-│   │       ├── IFlashBorrower.sol
-│   │       └── IINITCore.sol
+│   │   ├── interfaces/
+│   │   │   ├── IDexRouter.sol
+│   │   │   ├── IFlashBorrower.sol
+│   │   │   └── IINITCore.sol
+│   │   └── libraries/
+│   │       └── TransientReentrancyGuard.sol
 │   ├── script/
-│   │   └── Deploy.s.sol
+│   │   ├── Deploy.s.sol              # Local/testnet deployment
+│   │   └── DeployMainnet.s.sol       # Mantle mainnet deployment
 │   ├── test/
-│   │   ├── ActiveSentinel.t.sol
-│   │   ├── ActiveSentinelSecurity.t.sol
-│   │   ├── DexAdapters.t.sol
-│   │   └── SentinelModule1.t.sol
-│   └── lib/ (OpenZeppelin, forge-std)
-│
-├── agent-tee/               # TEE Agent (TypeScript)
-│   ├── package.json
-│   ├── src/
-│   │   ├── main.ts
-│   │   ├── executor.ts
-│   │   ├── types/index.ts
-│   │   ├── strategies/
-│   │   │   ├── clusteringEngine.ts
-│   │   │   ├── yieldArchitect.ts
-│   │   │   └── llmEngine.ts
-│   │   ├── services/
-│   │   │   ├── nansenClient.ts
-│   │   │   ├── dynamicWatchlist.ts
-│   │   │   ├── proposalPublisher.ts
-│   │   │   ├── rateLimiter.ts
-│   │   │   ├── sessionKeyRotator.ts
-│   │   │   ├── mevProtection.ts
-│   │   │   ├── remoteAttestation.ts
-│   │   │   ├── bloomFilter.ts
-│   │   │   ├── byrealClient.ts
-│   │   │   └── txEnrichment.ts
-│   │   ├── config/
-│   │   │   └── rwaRegistry.ts
-│   │   └── test/
-│   │       └── yieldArchitect.test.ts
-│   └── scripts/
-│       └── generateAgentCard.ts
-│
-├── bff/                     # BFF Server (Hono)
-│   ├── package.json
+│   │   ├── ActiveSentinel.t.sol      # Core tests
+│   │   ├── ActiveSentinelSecurity.t.sol # Security-focused tests
+│   │   ├── DexAdapters.t.sol         # Adapter tests
+│   │   └── SentinelModule1.t.sol     # Module tests
+│   ├── broadcast/                    # Deployment artifacts (tx receipts)
+│   ├── out/                          # Compiled ABIs + bytecode
+│   └── lib/                          # forge-std, openzeppelin-contracts
+├── bff/                              # Backend-for-Frontend
+│   ├── package.json                  # alphaflow-bff@1.0.0
 │   ├── tsconfig.json
+│   ├── Dockerfile
 │   ├── .env
 │   └── src/
-│       ├── index.ts
+│       ├── index.ts                  # Hono app + routes (443 lines)
 │       ├── services/
-│       │   ├── proposalService.ts
-│       │   ├── onChainOracle.ts
-│       │   └── reputationBatcher.ts
+│       │   ├── onChainOracle.ts      # Price staleness + simulation
+│       │   ├── proposalService.ts    # Redis locking + HMAC
+│       │   ├── reputationBatcher.ts  # Batch on-chain reputation updates
+│       │   └── wssBroadcaster.ts     # WebSocket + Redis Streams (325 lines)
 │       └── test/
 │           └── api.test.ts
-│
-├── frontend/                # Telegram Mini App (React)
+├── frontend/                         # PWA (alphaflow-pwa@2.0.0)
 │   ├── package.json
 │   ├── vite.config.ts
+│   ├── tailwind.config.js
+│   ├── postcss.config.js
+│   ├── tsconfig.json
+│   ├── vercel.json
+│   ├── index.html
 │   └── src/
-│       ├── main.tsx
-│       ├── App.tsx
-│       ├── vite-env.d.ts
-│       ├── components/
-│       │   └── InvestFlowApp.tsx
+│       ├── main.tsx                  # Provider tree entry
+│       ├── App.tsx                   # Auth gate + layout (88 lines)
+│       ├── config/
+│       │   └── wagmi.ts             # RainbowKit + Mantle config
+│       ├── providers/
+│       │   └── WebSocketProvider.tsx # Singleton WS with backoff
 │       ├── hooks/
-│       │   └── useWebAuthn.ts
-│       └── utils/
-│           └── bffClient.ts
-│
-├── devops/                  # Telegram Bot + Infra
-│   ├── package.json
-│   ├── .env
+│       │   └── useAuthJWT.ts        # SIWE auth hook
+│       ├── components/
+│       │   ├── DashboardLayout.tsx   # CSS Grid 12-col
+│       │   ├── TopNav.tsx           # Header + ConnectButton
+│       │   ├── LiveAgentConsole.tsx  # Real-time insight feed
+│       │   ├── ProofOfAlpha.tsx     # On-chain hash verification
+│       │   ├── ERC8004Explorer.tsx  # Agent card browser
+│       │   ├── ReputationHeatmap.tsx # Epoch score visualization
+│       │   ├── RWARiskPanel.tsx     # Risk indicators
+│       │   ├── MEVMetrics.tsx       # Gas efficiency metrics
+│       │   └── ProposalView.tsx     # Trade execution UI
+│       ├── utils/
+│       │   └── bffClient.ts        # BFF API client
+│       └── styles/
+│           └── index.css            # Tailwind + CRT scanline
+├── agent-tee/                        # TEE Agent
+│   ├── package.json                  # alphaflow-agent-tee@1.0.0
+│   ├── tsconfig.json
+│   ├── Dockerfile
+│   ├── scripts/
+│   │   └── generateAgentCard.ts     # ERC-8004 metadata generator
 │   └── src/
-│       └── tg-bot/
-│           ├── index.ts
-│           ├── proposalStore.ts
-│           └── config.ts
-│
-├── docs/                    # Дополнительная документация
-├── tests/                   # E2E тесты
-└── .github/                 # CI/CD workflows
+│       ├── main.ts                  # Entry + polling loop (637 lines)
+│       ├── executor.ts              # On-chain commit executor
+│       ├── types/
+│       │   └── index.ts            # Shared type definitions
+│       ├── config/
+│       │   └── rwaRegistry.ts      # RWA asset registry
+│       ├── services/
+│       │   ├── bloomFilter.ts      # Noise wallet filtering
+│       │   ├── byrealClient.ts     # Byreal CLMM aggregator
+│       │   ├── circuitBreaker.ts   # Safety halt (396 lines)
+│       │   ├── dynamicWatchlist.ts  # Redis wallet tracking
+│       │   ├── mevProtection.ts    # Private mempool routing
+│       │   ├── nansenClient.ts     # Nansen MCP API
+│       │   ├── proposalPublisher.ts # Redis Streams XADD
+│       │   ├── rateLimiter.ts      # API rate limiting
+│       │   ├── remoteAttestation.ts # TEE attestation
+│       │   ├── sessionKeyRotator.ts # ZeroDev key rotation
+│       │   └── txEnrichment.ts     # Tx metadata enrichment
+│       ├── strategies/
+│       │   ├── clusteringEngine.ts # Wallet cluster discovery
+│       │   ├── llmEngine.ts        # GPT-4 reasoning
+│       │   └── yieldArchitect.ts   # Proposal + EIP-712 signing
+│       └── test/
+│           ├── circuitBreaker.test.ts
+│           ├── e2e-mainnet.ts       # Mainnet qualification test
+│           └── yieldArchitect.test.ts
+├── tests/
+│   └── e2e-pipeline.test.ts         # Integration test (Anvil fork)
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── PROJECT_DETAILS.md
+│   └── PROJECT_OVERVIEW.md
+├── docker-compose.yml
+├── README.md
+├── PROJECT.md
+├── CONCEPT.md
+├── ARCHITECTURE.md
+└── FULL_PROJECT_DESCRIPTION.md       # ← This file
 ```
 
 ---
 
-*Документ сгенерирован автоматически на основе анализа исходного кода.*  
-*Последнее обновление: Май 2025*
+## Build & Run
+
+### Prerequisites
+
+- Node.js 20+
+- pnpm or npm
+- Foundry (forge, cast, anvil)
+- Redis 7+
+- Docker + Docker Compose (optional)
+
+### Quick Start (Docker Compose)
+
+```bash
+# Clone and enter project
+git clone https://github.com/rocknrolla77/alphaflow-suite.git
+cd alphaflow-suite
+
+# Copy env files
+cp .env.example .env
+cp bff/.env.example bff/.env
+# Edit .env files with your keys
+
+# Start all services
+docker compose up -d
+
+# Verify
+curl http://localhost:3001/api/health
+```
+
+### Manual Start
+
+```bash
+# 1. Start Redis
+redis-server --daemonize yes
+
+# 2. Build & deploy contracts (local fork)
+cd contracts
+forge build
+anvil --fork-url https://rpc.mantle.xyz &
+forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --broadcast
+
+# 3. Start BFF
+cd ../bff
+npm install
+npm run dev  # tsx watch src/index.ts
+
+# 4. Start Frontend
+cd ../frontend
+npm install
+npm run dev  # vite, port 5173
+
+# 5. Start TEE Agent (dev mode)
+cd ../agent-tee
+npm install
+npm run dev  # tsx src/main.ts
+```
+
+### Build for Production
+
+```bash
+# Contracts
+cd contracts && forge build --optimize
+
+# BFF
+cd bff && npm run build  # tsc → dist/
+
+# Frontend
+cd frontend && npm run build  # vite build → dist/
+
+# Agent
+cd agent-tee && npm run build  # tsc → dist/
+```
+
+---
+
+## Testing Strategy
+
+### Smart Contracts (Foundry)
+
+```bash
+cd contracts
+
+# Unit tests
+forge test -vvv
+
+# Fuzz tests (1000 runs)
+forge test --match-test "testFuzz" -vvv
+
+# Invariant tests (256 runs, depth 50)
+forge test --match-test "invariant" -vvv
+
+# Security-focused tests
+forge test --match-path "test/ActiveSentinelSecurity.t.sol" -vvv
+
+# Gas report
+forge test --gas-report
+
+# Coverage
+forge coverage
+```
+
+**Test Files:**
+- `ActiveSentinel.t.sol` — Core flash arb logic, success paths
+- `ActiveSentinelSecurity.t.sol` — Reentrancy, replay, authorization, deadlines
+- `DexAdapters.t.sol` — Adapter swap correctness
+- `SentinelModule1.t.sol` — Identity + Auditor integration
+
+### TypeScript (Vitest)
+
+```bash
+# BFF tests
+cd bff && npm test
+
+# Agent tests
+cd agent-tee && npm test
+
+# Integration E2E (requires Redis + Anvil fork)
+cd tests && npx tsx e2e-pipeline.test.ts
+```
+
+### Mainnet E2E Qualification
+
+```bash
+cd agent-tee
+DEPLOYER_PRIVATE_KEY=0x... npx tsx src/test/e2e-mainnet.ts
+```
+
+### CI Pipeline (`.github/workflows/ci.yml`)
+
+Jobs:
+1. **contracts** — `forge test` (all Solidity tests)
+2. **typescript** — `vitest` (BFF + Agent unit tests)
+3. **docker** — Build all Dockerfiles
+4. **integration** — Anvil fork + deploy + full E2E pipeline
+
+---
+
+## Protocol Integrations
+
+### INIT Capital (Flash Loans)
+
+- **Interface**: `IINITCore.flashBorrow(token, amount, data)`
+- **Callback**: `onFlashBorrow(initiator, token, amount, fee, data)`
+- **Fee**: Variable (currently ~0.05%)
+- **Usage**: Borrow token A → swap across DEXes → repay + fee
+
+### Merchant Moe (DEX — LBRouter)
+
+- **Type**: Liquidity Book (concentrated liquidity, bin-based)
+- **Interface**: `LBRouter.swapExactTokensForTokens(amountIn, minOut, path, to, deadline)`
+- **Usage**: First swap in arb route (A → B)
+- **Adapter**: `MerchantMoeAdapter.sol`
+
+### Agni Finance (DEX — UniV3 Fork)
+
+- **Type**: Concentrated Liquidity (tick-based, UniswapV3 clone)
+- **Interface**: `SwapRouter.exactInputSingle(params)`
+- **Usage**: Second swap in arb route (B → A)
+- **Adapter**: `AgniAdapter.sol`
+
+### Nansen MCP (Smart Money Signals)
+
+- **API**: Nansen Model Context Protocol
+- **Signals**: Wallet labels, transaction volumes, token flows
+- **Usage**: Identify smart money activity on Mantle for arb opportunity detection
+
+### ZeroDev (Account Abstraction — Future)
+
+- **SDK**: @zerodev/sdk v5.5
+- **Kernel**: v3.1 (ERC-4337 Smart Account)
+- **Validator**: Passkey (WebAuthn)
+- **Session Keys**: Scoped permissions for TEE agent
+- **Status**: Integrated in agent-tee, not active in current User-Pays mode
+
+### Phala Network (TEE)
+
+- **Platform**: DStack CVM (Confidential Virtual Machine)
+- **Attestation**: Remote attestation via Intel SGX / TDX
+- **Security**: Code integrity proof, sealed execution environment
+- **Key Management**: Ephemeral keys generated in-enclave
+
+---
+
+## ERC-8004 Agent Identity Standard
+
+AlphaFlow implements the **ERC-8004 Agent Card** standard for AI agent identity:
+
+### Concept
+
+Each autonomous agent is represented by a unique on-chain NFT (ERC-721) containing:
+- **Agent Card URI** — JSON metadata describing capabilities, version, TEE attestation
+- **Soulbound-like binding** — 1 address = 1 agent (non-transferable identity)
+- **On-chain history** — Commit count, reputation score linked to tokenId
+
+### Implementation (`SentinelIdentity.sol`)
+
+```solidity
+// Registration
+function registerAgent(string calldata agentCardURI) external returns (uint256 tokenId);
+
+// Identity lookup
+function agentOf(address owner) external view returns (uint256 tokenId);
+
+// Metadata update
+function updateAgentCard(uint256 tokenId, string calldata newURI) external;
+```
+
+### Agent Card Metadata Schema
+
+```json
+{
+    "name": "AlphaFlow Sentinel Agent #1",
+    "description": "TEE-secured flash arbitrage agent on Mantle Network",
+    "version": "1.0.0",
+    "capabilities": ["flash_arbitrage", "smart_money_analysis", "proof_of_alpha"],
+    "tee_platform": "phala_dstack",
+    "attestation_hash": "0x...",
+    "created_at": 1780000000,
+    "chain_id": 5000
+}
+```
+
+---
+
+## Circuit Breaker Safety System
+
+The CircuitBreaker is an **off-chain safety module** running inside the TEE that prevents dangerous proposals from being published.
+
+### Three Hardcoded Checks
+
+| Check | Threshold | Description |
+|-------|-----------|-------------|
+| **Slippage** | ≤ 3.0% | Maximum estimated trade slippage |
+| **Gas Spike** | ≤ 1.5x median | Current gas vs 20-block rolling median |
+| **Oracle Deviation** | ≤ 2.0% | Oracle price vs DEX spot price divergence |
+
+### Architecture
+
+```typescript
+class CircuitBreaker {
+    // Thresholds sealed in TEE image (immutable at runtime)
+    private readonly MAX_SLIPPAGE = 0.03;
+    private readonly MAX_GAS_MULTIPLIER = 1.5;
+    private readonly MAX_ORACLE_DEVIATION = 0.02;
+
+    // Rolling state
+    private gasHistory: bigint[] = [];  // Last 20 blocks
+    private lastHaltTime: number = 0;
+    private readonly COOLDOWN_MS = 60_000;  // 60s cooldown after halt
+
+    async validateMarketConditions(params: MarketParams): Promise<CBResult>;
+}
+```
+
+### Failure Modes
+
+- **CriticalHaltError** — Thrown when any check fails. Aborts the entire pipeline.
+- **Cooldown** — After a halt, 60 seconds must pass before new proposals are allowed.
+- **Logging** — All checks logged with values for post-mortem analysis.
+
+### Gas Spike Detection Algorithm
+
+```
+1. Fetch baseFeePerGas from latest Mantle block
+2. Maintain rolling buffer of last 20 gas prices
+3. Compute median of buffer
+4. multiplier = currentGas / medianGas
+5. If multiplier > 1.5 → HALT (network congestion detected)
+```
+
+---
+
+## Proof-of-Alpha Mechanism
+
+### Concept
+
+Every AI-generated insight is **cryptographically committed on-chain BEFORE** it is published or acted upon. This creates an immutable, timestamped proof that the agent generated the insight at a specific time.
+
+### Hash Computation
+
+```typescript
+// Insight Hash (identifies the trade proposal)
+insightHash = keccak256(
+    encodePacked(
+        ["address", "string", "uint256", "uint256"],
+        [asset, action, amount, timestamp]
+    )
+);
+
+// Reasoning Hash (identifies the reasoning content)
+reasoningHash = keccak256(
+    encodePacked(
+        ["string", "uint8", "string", "uint8"],
+        [interpretation, confidence*100, rationale, riskScore]
+    )
+);
+```
+
+### On-Chain Commitment
+
+```solidity
+// AlphaAuditor.sol
+function commitInsight(uint256 agentId, bytes32 insightHash) external {
+    require(identityRegistry.ownerOf(agentId) == msg.sender);
+    require(insightHash != bytes32(0));
+    agentCommitCount[agentId]++;
+    emit InsightCommitted(agentId, insightHash, block.timestamp);
+}
+```
+
+### Frontend Verification
+
+The `ProofOfAlpha` component performs client-side verification:
+
+1. Receives insight from WebSocket
+2. Locally computes `keccak256(encodePacked(...))` from insight data
+3. Queries AlphaAuditor contract for `InsightCommitted` events matching the hash
+4. Compares local hash vs on-chain event hash
+5. Displays status: **HARDWARE VERIFIED** (match) or **UNVERIFIED** (no match)
+
+### Why This Matters
+
+- **Prevents frontrunning** — Hash committed before anyone else sees the insight
+- **Proves timing** — Block timestamp proves when the insight was generated
+- **Auditable** — Full history recoverable from event logs (no storage cost)
+- **Trustless** — Anyone can verify without trusting the agent
+- **TEE-backed** — Insight generated in hardware enclave, committed immediately
+
+---
+
+## Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| **Event-only hash storage** | Gas optimization: emit is 375 gas vs SSTORE 20000 gas. Full history recoverable from logs. |
+| **TSTORE reentrancy guard** | EIP-1153 transient storage: 100 gas per check vs 5000 gas for SSTORE. 98% gas reduction. |
+| **Ephemeral TEE keys** | Zero persistence = zero extraction surface. Key lives only in enclave RAM. |
+| **BLOCKING commit before publish** | Guarantees every published proposal has on-chain proof. No orphan proposals. |
+| **User-Pays (EOA) over AA** | Simpler UX for hackathon demo. ZeroDev infrastructure integrated for future paymaster flow. |
+| **Redis Streams over Pub/Sub** | Persistence, replay capability, consumer groups. Message not lost on disconnect. |
+| **HMAC over API keys** | Timing-safe verification prevents timing attacks. Shared secret between TEE and BFF. |
+| **Optimistic locking (SETNX)** | Prevents race conditions without distributed locks. 60s TTL auto-releases dead locks. |
+| **CRT scanline overlay** | Pure CSS animation. Zero JS overhead. Brand differentiation (cyberpunk aesthetic). |
+
+---
+
+## Future Roadmap
+
+- [ ] **Account Abstraction (ZeroDev Paymaster)** — Gasless UX via session keys
+- [ ] **Formal Verification** — Certora/Halmos for ActiveSentinel invariants
+- [ ] **Multi-Agent Swarm** — Multiple TEE agents with reputation-weighted voting
+- [ ] **Subgraph Indexer** — TheGraph indexing for InsightCommitted events
+- [ ] **Mobile App** — React Native with WalletConnect v2
+- [ ] **Cross-Chain** — Expand to Arbitrum, Optimism via LayerZero messaging
+- [ ] **MEV Protection** — Flashbots Protect integration for execution phase
+
+---
+
+## License
+
+MIT
+
+---
+
+## Links
+
+- **Repository**: https://github.com/rocknrolla77/alphaflow-suite
+- **MantleScan (AlphaAuditor)**: https://mantlescan.xyz/address/0xbF073B94a020626258626918d82bce05DC5E2aE0
+- **MantleScan (ActiveSentinel)**: https://mantlescan.xyz/address/0xfC7069a9f7B6C4c0a5704b28FEF3e2E47e0017A8
+- **MantleScan (SentinelIdentity)**: https://mantlescan.xyz/address/0xC4499035f68737c3d8a917A92bbFe043F4Ed10CC
+- **Proof-of-Alpha TX**: https://mantlescan.xyz/tx/0xedcfc7a7b1412efde2cfde1f29eef2bca6d37fe667f20dc77f00dd299ee44a08
+- **WalletConnect Dashboard**: https://dashboard.reown.com
+- **Phala Network**: https://phala.network
+- **INIT Capital**: https://init.capital
+- **Merchant Moe**: https://merchantmoe.com
+- **Agni Finance**: https://agni.finance
