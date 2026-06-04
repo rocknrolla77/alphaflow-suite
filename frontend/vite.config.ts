@@ -8,12 +8,6 @@ export default defineConfig({
     port: 5173,
     host: true,
   },
-  resolve: {
-    alias: {
-      // Polyfill Node.js "events" for browser (ZeroDev SDK uses EventEmitter)
-      events: "events",
-    },
-  },
   build: {
     target: "es2022",
     outDir: "dist",
@@ -23,12 +17,9 @@ export default defineConfig({
       output: {
         manualChunks: {
           vendor: ["react", "react-dom"],
-          web3: ["viem"],
+          web3: ["viem", "wagmi", "@rainbow-me/rainbowkit"],
         },
       },
     },
-  },
-  define: {
-    global: "globalThis",
   },
 });

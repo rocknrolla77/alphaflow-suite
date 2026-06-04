@@ -1,11 +1,9 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
-  readonly VITE_BFF_URL: string;
-  readonly VITE_ZERODEV_PROJECT_ID: string;
-  readonly VITE_BUNDLER_URL: string;
-  readonly VITE_PAYMASTER_URL: string;
-  readonly VITE_SENTINEL_ADDRESS: string;
+  readonly VITE_BFF_WSS_URL: string;
+  readonly VITE_BFF_HTTP_URL: string;
+  readonly VITE_WC_PROJECT_ID: string;
 }
 
 interface ImportMeta {

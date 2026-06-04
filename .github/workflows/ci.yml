@@ -69,8 +69,7 @@ jobs:
       - name: Build BFF
         run: docker build -t alphaflow-bff ./bff
 
-      - name: Build TG Bot
-        run: docker build -t alphaflow-tg-bot ./devops
+
 
       - name: Build TEE Agent
         run: docker build -t alphaflow-agent-tee ./agent-tee

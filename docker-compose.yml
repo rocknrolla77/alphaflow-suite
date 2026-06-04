@@ -59,24 +59,7 @@ services:
       timeout: 5s
       retries: 3
 
-  # ─── Telegram Bot (HITL) ────────────────────────────────────────────
-  tg-bot:
-    build:
-      context: ./devops
-      dockerfile: Dockerfile
-    container_name: alphaflow_tg_bot
-    environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - REDIS_URL=redis://:${REDIS_PASSWORD:-alphaflow_dev}@redis:6379
-      - TARGET_CHAT_ID=${TARGET_CHAT_ID}
-      - MINI_APP_URL=${MINI_APP_URL}
-      - PROPOSAL_HMAC_SECRET=${PROPOSAL_HMAC_SECRET}
-      - MAX_SLIPPAGE_PCT=${MAX_SLIPPAGE_PCT:-2}
-      - PROPOSAL_TTL_SEC=${PROPOSAL_TTL_SEC:-300}
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
+
 
   # ─── TEE Agent (Development Mode — NOT in CVM) ─────────────────────
   # In production: deployed via `dstack deploy` to Phala Network

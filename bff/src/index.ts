@@ -40,6 +40,11 @@ import {
     stopReputationBatcher,
 } from "./services/reputationBatcher.js";
 
+import {
+    attachWebSocketServer,
+    shutdownWss,
+} from "./services/wssBroadcaster.js";
+
 // ─── App Configuration ────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env["PORT"] ?? "3001", 10);
@@ -395,11 +400,15 @@ console.log(`[BFF] Port: ${PORT}`);
 console.log(`[BFF] CORS origins: ${ALLOWED_ORIGINS.join(", ")}`);
 console.log(`[BFF] HMAC_SECRET: ${"*".repeat(8)} (loaded)`);
 
-serve({
+const server = serve({
     fetch: app.fetch,
     port: PORT,
 }, (info) => {
     console.log(`[BFF] Server listening on http://0.0.0.0:${info.port}`);
+
+    // ─── Attach WebSocket Server (WSS + Redis Streams consumer) ──────────
+    attachWebSocketServer(server);
+    console.log(`[BFF] WSS attached at ws://0.0.0.0:${info.port}/ws`);
 
     // ─── Start Reputation Batcher Daemon ──────────────────────────────────
     // Агрегирует голоса из Redis и отправляет batch tx в ReputationRegistry.
@@ -421,9 +430,10 @@ serve({
 
 const shutdown = async (): Promise<void> => {
     console.log("\n[BFF] Shutting down gracefully...");
+    await shutdownWss();
     await stopReputationBatcher();
     await shutdownRedis();
-    console.log("[BFF] Redis disconnected. Bye.");
+    console.log("[BFF] All services stopped. Bye.");
     process.exit(0);
 };
 

@@ -5,7 +5,7 @@
 // АРХИТЕКТУРА:
 //   setInterval (default 5 min) → readAndResetMetrics() → buildBatch() → submitTx()
 //
-// Redis ключи (пишет tg-bot):
+// Redis ключи (пишутся через HITL voting endpoint):
 //   agent_feedback_score:{agentId}  → net score (сумма +1/-1 от голосов)
 //   agent_feedback_count:{agentId}  → total votes за период
 //
@@ -40,13 +40,16 @@ import { Redis } from "ioredis";
 // ─── Environment Validation ───────────────────────────────────────────────────
 
 const RELAYER_PRIVATE_KEY = process.env["RELAYER_PRIVATE_KEY"] as Hex | undefined;
-if (!RELAYER_PRIVATE_KEY) {
-    throw new Error("FATAL: RELAYER_PRIVATE_KEY env var required for reputationBatcher");
-}
-
 const REPUTATION_REGISTRY_ADDRESS = process.env["REPUTATION_REGISTRY_ADDRESS"] as Address | undefined;
-if (!REPUTATION_REGISTRY_ADDRESS) {
-    throw new Error("FATAL: REPUTATION_REGISTRY_ADDRESS env var required");
+
+// Deferred validation: only throw when startReputationBatcher() is actually called
+function validateReputationConfig(): void {
+    if (!RELAYER_PRIVATE_KEY) {
+        throw new Error("FATAL: RELAYER_PRIVATE_KEY env var required for reputationBatcher");
+    }
+    if (!REPUTATION_REGISTRY_ADDRESS) {
+        throw new Error("FATAL: REPUTATION_REGISTRY_ADDRESS env var required");
+    }
 }
 
 const REDIS_URL = process.env["REDIS_URL"] ?? "redis://localhost:6379";
@@ -121,31 +124,47 @@ function getRedis(): Redis {
     return redisClient;
 }
 
-// ─── Viem Clients ────────────────────────────────────────────────────────────
+// ─── Viem Clients (lazy — only initialized when startReputationBatcher is called) ───
 
-// Аккаунт оракула (BFF Relayer)
-const relayerAccount = privateKeyToAccount(RELAYER_PRIVATE_KEY);
+let relayerAccount: ReturnType<typeof privateKeyToAccount> | null = null;
+let publicClient: ReturnType<typeof createPublicClient> | null = null;
+let walletClient: ReturnType<typeof createWalletClient> | null = null;
 
-// Public client с fallback для чтения состояния / gas estimation
-const publicClient = createPublicClient({
-    chain: mantleTestnet,
-    transport: fallback([
-        http(RPC_PRIMARY),
-        http(RPC_FALLBACK1),
-        http(RPC_FALLBACK2),
-    ], { rank: false }),
-});
+function getRelayerAccount() {
+    if (!relayerAccount) {
+        relayerAccount = privateKeyToAccount(RELAYER_PRIVATE_KEY!);
+    }
+    return relayerAccount;
+}
 
-// Wallet client для отправки транзакций
-const walletClient = createWalletClient({
-    account: relayerAccount,
-    chain: mantleTestnet,
-    transport: fallback([
-        http(RPC_PRIMARY),
-        http(RPC_FALLBACK1),
-        http(RPC_FALLBACK2),
-    ], { rank: false }),
-});
+function getPublicClientRep() {
+    if (!publicClient) {
+        publicClient = createPublicClient({
+            chain: mantleTestnet,
+            transport: fallback([
+                http(RPC_PRIMARY),
+                http(RPC_FALLBACK1),
+                http(RPC_FALLBACK2),
+            ], { rank: false }),
+        });
+    }
+    return publicClient;
+}
+
+function getWalletClientRep() {
+    if (!walletClient) {
+        walletClient = createWalletClient({
+            account: getRelayerAccount(),
+            chain: mantleTestnet,
+            transport: fallback([
+                http(RPC_PRIMARY),
+                http(RPC_FALLBACK1),
+                http(RPC_FALLBACK2),
+            ], { rank: false }),
+        });
+    }
+    return walletClient;
+}
 
 // ─── Core: Read and Reset Metrics from Redis ──────────────────────────────────
 
@@ -382,6 +401,7 @@ let batcherInterval: ReturnType<typeof setInterval> | null = null;
  * Вызывается один раз из bff/src/index.ts при старте сервера.
  */
 export function startReputationBatcher(): void {
+    validateReputationConfig();
     console.log(
         `[ReputationBatcher] Starting | ` +
         `interval=${BATCH_INTERVAL_MS}ms (${BATCH_INTERVAL_MS / 60000} min) | ` +

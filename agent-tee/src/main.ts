@@ -32,6 +32,7 @@ import { YieldArchitect } from "./strategies/yieldArchitect.js";
 import { ClusteringEngine, type ClusteringEngineConfig } from "./strategies/clusteringEngine.js";
 import { SentinelExecutor, type ExecutorConfig } from "./executor.js";
 import { ProposalPublisher } from "./services/proposalPublisher.js";
+import { CircuitBreaker, CriticalHaltError } from "./services/circuitBreaker.js";
 import { DynamicWatchlist } from "./services/dynamicWatchlist.js";
 import { NansenMCPClient, type NansenMCPConfig } from "./services/nansenClient.js";
 
@@ -134,18 +135,21 @@ class ProposalPipeline {
     private readonly architect: YieldArchitect;
     private readonly executor: SentinelExecutor;
     private readonly publisher: ProposalPublisher;
+    private readonly circuitBreaker: CircuitBreaker;
     private readonly config: AgentConfig;
 
     constructor(
         architect: YieldArchitect,
         executor: SentinelExecutor,
         publisher: ProposalPublisher,
-        config: AgentConfig
+        config: AgentConfig,
+        circuitBreaker?: CircuitBreaker
     ) {
         this.architect = architect;
         this.executor = executor;
         this.publisher = publisher;
         this.config = config;
+        this.circuitBreaker = circuitBreaker ?? new CircuitBreaker();
     }
 
     /**
@@ -218,8 +222,32 @@ class ProposalPipeline {
 
         console.log(`[Pipeline:${pipelineId}] Step 3 ✓ Final proposal signed`);
 
-        // ─── STEP 4: Publish to Redis → Telegram Bot ──────────────────────
-        console.log(`[Pipeline:${pipelineId}] Step 4: Publishing to Redis...`);
+        // ─── STEP 4: Circuit Breaker Validation (BLOCKING) ────────────────
+        console.log(`[Pipeline:${pipelineId}] Step 4: Circuit Breaker validation...`);
+
+        try {
+            await this.circuitBreaker.validateMarketConditions({
+                estimatedSlippage: profile.maxSlippageBps / 10000,
+                // Gas price fetched automatically from RPC inside CircuitBreaker
+                // Oracle prices: in production, fetched from Nansen/Pyth before this step
+            });
+            console.log(`[Pipeline:${pipelineId}] Step 4 ✓ Market conditions validated`);
+        } catch (haltError) {
+            if (haltError instanceof CriticalHaltError) {
+                console.error(
+                    `[Pipeline:${pipelineId}] Step 4 ✗ CIRCUIT BREAKER TRIGGERED\n` +
+                    `  Reason: ${haltError.reason}\n` +
+                    `  Action: Proposal WILL NOT be published to Redis.\n` +
+                    `  The UI will NOT display this dangerous proposal.`
+                );
+                console.error(`[Pipeline:${pipelineId}] ═══ ABORTED (Circuit Breaker) ═══`);
+                throw haltError;
+            }
+            throw haltError;
+        }
+
+        // ─── STEP 5: Publish to Redis → Frontend WebSocket ──────────────────
+        console.log(`[Pipeline:${pipelineId}] Step 5: Publishing to Redis...`);
 
         await this.publisher.publish(
             {
@@ -231,7 +259,7 @@ class ProposalPipeline {
             profile.maxSlippageBps / 100
         );
 
-        console.log(`[Pipeline:${pipelineId}] Step 4 ✓ Published to Redis`);
+        console.log(`[Pipeline:${pipelineId}] Step 5 ✓ Published to Redis`);
         console.log(`[Pipeline:${pipelineId}] ═══ COMPLETE ═══`);
         console.log(`  Asset: ${finalProposal.asset}`);
         console.log(`  Action: ${finalProposal.action}`);
@@ -451,16 +479,17 @@ async function main(): Promise<void> {
     const executor = new SentinelExecutor(executorConfig);
     console.log(`[TEE] SentinelExecutor ready (Proof-of-Alpha + Flash Arb)`);
 
-    // ─── 8. Initialize ProposalPublisher ──────────────────────────────────
+    // ─── 8. Initialize ProposalPublisher (Redis Streams) ──────────────────
     const publisher = new ProposalPublisher(
         {
             redisUrl: config.redisUrl,
-            channel: "tee_proposals",
+            streamKey: "agent_insights",
             defaultDeadlineOffsetSec: config.proposalTtlSeconds,
+            maxStreamLength: 1000,
         },
         null
     );
-    console.log(`[TEE] ProposalPublisher ready (channel: tee_proposals)`);
+    console.log(`[TEE] ProposalPublisher ready (stream: agent_insights)`);
 
     // ─── 9. Initialize Nansen MCP Client ──────────────────────────────────
     const nansenConfig: NansenMCPConfig = {
@@ -473,14 +502,20 @@ async function main(): Promise<void> {
     const nansenClient = new NansenMCPClient(nansenConfig);
     console.log(`[TEE] NansenMCPClient ready (chain: ${nansenConfig.chain})`);
 
-    // ─── 10. Create Pipeline ──────────────────────────────────────────────
-    const pipeline = new ProposalPipeline(architect, executor, publisher, config);
-    console.log(`[TEE] ProposalPipeline ready (commit-before-publish invariant)`);
+    // ─── 10. Initialize Circuit Breaker ──────────────────────────────────
+    const circuitBreaker = new CircuitBreaker(
+        process.env["MANTLE_RPC_URL"] ?? "https://rpc.mantle.xyz"
+    );
+    console.log(`[TEE] CircuitBreaker ready (thresholds: slip=3%, gas=1.5x, oracle=2%)`);
 
-    // ─── 11. Start health/attestation endpoint ────────────────────────────
+    // ─── 11. Create Pipeline ──────────────────────────────────────────────
+    const pipeline = new ProposalPipeline(architect, executor, publisher, config, circuitBreaker);
+    console.log(`[TEE] ProposalPipeline ready (commit-before-publish + circuit-breaker)`);
+
+    // ─── 12. Start health/attestation endpoint ────────────────────────────
     startHealthServer(config.healthPort, architect.signerAddress, config, watchlist);
 
-    // ─── 12. User risk profile (загружается из Redis в production) ────────
+    // ─── 13. User risk profile (загружается из Redis в production) ────────
     const profile: UserRiskProfile = {
         accountAddress: process.env["USER_ACCOUNT_ADDRESS"] ?? "0x0000000000000000000000000000000000000000",
         availableBalance: ethers.parseEther(process.env["USER_BALANCE_ETH"] ?? "10000"),
