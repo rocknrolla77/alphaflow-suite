@@ -18,7 +18,6 @@
     "@tanstack/react-query": "^5.60.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
-    "siwe": "^3.0.0",
     "viem": "^2.21.0",
     "wagmi": "^2.14.0"
   },

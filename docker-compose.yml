@@ -46,8 +46,12 @@ services:
       - MANTLE_RPC_PRIMARY=${MANTLE_RPC_PRIMARY:-https://rpc.mantle.xyz}
       - MANTLE_RPC_FALLBACKS=${MANTLE_RPC_FALLBACKS:-https://rpc.mantle.xyz,https://rpc.ankr.com/mantle}
       - ACTIVE_SENTINEL_ADDRESS=${ACTIVE_SENTINEL_ADDRESS}
+      - DISPATCHER_ADDRESS=${DISPATCHER_ADDRESS}
+      - WORKER_1_ADDRESS=${WORKER_1_ADDRESS}
+      - WORKER_2_ADDRESS=${WORKER_2_ADDRESS}
+      - WORKER_3_ADDRESS=${WORKER_3_ADDRESS}
       - MAX_STALENESS_PCT=${MAX_STALENESS_PCT:-2}
-      - TMA_ORIGIN=${TMA_ORIGIN:-http://localhost:5173}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:4173}
       - PORT=3001
     depends_on:
       redis:
@@ -139,9 +143,10 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ─── Anvil (Mantle Fork for Testing) ───────────────────────────────
+  # ─── Anvil (Mantle Fork for Dev/Testing) ─────────────────────────────────────
   anvil:
     image: ghcr.io/foundry-rs/foundry:latest
+    container_name: alphaflow_anvil
     command: >
       anvil
       --fork-url ${MANTLE_RPC_PRIMARY:-https://rpc.mantle.xyz}
@@ -149,10 +154,40 @@ services:
       --block-time 2
       --host 0.0.0.0
       --port 8545
+      --accounts 10
+      --balance 10000
     ports:
       - "8545:8545"
     profiles:
-      - test  # Only runs during testing
+      - dev
+      - test
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo 'ok'"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # ─── Frontend PWA (Dev Server) ──────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: alphaflow_frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_BFF_HTTP_URL=http://localhost:3001
+      - VITE_BFF_WSS_URL=ws://localhost:3001/ws
+      - VITE_WC_PROJECT_ID=${VITE_WC_PROJECT_ID:-9add069a8830633afa75d8e490c3f246}
+      - VITE_ALPHA_AUDITOR_ADDRESS=${ALPHA_AUDITOR_ADDRESS}
+      - VITE_WORKER_1_ADDRESS=${WORKER_1_ADDRESS}
+      - VITE_WORKER_2_ADDRESS=${WORKER_2_ADDRESS}
+      - VITE_WORKER_3_ADDRESS=${WORKER_3_ADDRESS}
+    depends_on:
+      bff:
+        condition: service_healthy
+    profiles:
+      - dev
 
 volumes:
   redis_data:

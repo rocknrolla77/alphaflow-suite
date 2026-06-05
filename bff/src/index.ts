@@ -48,7 +48,7 @@ import {
 // ─── App Configuration ────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env["PORT"] ?? "3001", 10);
-const ALLOWED_ORIGINS = (process.env["ALLOWED_ORIGINS"] ?? "https://t.me,https://web.telegram.org").split(",");
+const ALLOWED_ORIGINS = (process.env["ALLOWED_ORIGINS"] ?? "http://localhost:5173,http://localhost:4173,https://alphaflow.vercel.app").split(",");
 
 // Default DEX pair address for staleness checks (configurable per proposal)
 const DEFAULT_PAIR_ADDRESS = (process.env["DEFAULT_PAIR_ADDRESS"] ?? "0x0000000000000000000000000000000000000000") as Address;
@@ -374,7 +374,67 @@ app.get("/api/health", async (c) => {
     }, healthy ? 200 : 503);
 });
 
-// ─── 404 Fallback ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+//                        SWARM ECONOMY ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── GET /api/swarm/balances ──────────────────────────────────────────────────
+
+/**
+ * Public endpoint: returns Dispatcher pool balance + worker balances.
+ * Used by frontend SwarmMetrics panel (polled every 10s).
+ * No auth required (Observer Mode).
+ */
+app.get("/api/swarm/balances", async (c) => {
+    try {
+        const { createPublicClient, http, formatEther } = await import("viem");
+        const { mantle } = await import("viem/chains");
+
+        const rpcUrl = process.env["MANTLE_RPC_PRIMARY"] ?? "https://rpc.mantle.xyz";
+        const client = createPublicClient({
+            chain: mantle,
+            transport: http(rpcUrl),
+        });
+
+        const dispatcherAddress = process.env["DISPATCHER_ADDRESS"] as `0x${string}` | undefined;
+        const worker1 = process.env["WORKER_1_ADDRESS"] as `0x${string}` | undefined;
+        const worker2 = process.env["WORKER_2_ADDRESS"] as `0x${string}` | undefined;
+        const worker3 = process.env["WORKER_3_ADDRESS"] as `0x${string}` | undefined;
+
+        // Fetch balances in parallel
+        const addresses = [dispatcherAddress, worker1, worker2, worker3].filter(Boolean) as `0x${string}`[];
+
+        const balances = await Promise.all(
+            addresses.map((addr) => client.getBalance({ address: addr }).catch(() => 0n))
+        );
+
+        const [dispBal, w1Bal, w2Bal, w3Bal] = balances;
+
+        return c.json({
+            dispatcherBalance: formatEther(dispBal ?? 0n),
+            workers: [
+                { id: "byreal-worker-1", address: worker1 ?? "0x???", balance: formatEther(w1Bal ?? 0n), relayCount: 0 },
+                { id: "byreal-worker-2", address: worker2 ?? "0x???", balance: formatEther(w2Bal ?? 0n), relayCount: 0 },
+                { id: "byreal-worker-3", address: worker3 ?? "0x???", balance: formatEther(w3Bal ?? 0n), relayCount: 0 },
+            ],
+            timestamp: Math.floor(Date.now() / 1000),
+        }, 200);
+    } catch (err) {
+        console.error("[BFF] /api/swarm/balances error:", err);
+        return c.json({
+            dispatcherBalance: "—",
+            workers: [
+                { id: "byreal-worker-1", address: "0x???", balance: "—", relayCount: 0 },
+                { id: "byreal-worker-2", address: "0x???", balance: "—", relayCount: 0 },
+                { id: "byreal-worker-3", address: "0x???", balance: "—", relayCount: 0 },
+            ],
+            error: "RPC unavailable",
+            timestamp: Math.floor(Date.now() / 1000),
+        }, 200);
+    }
+});
+
+// ─── 404 Fallback ─────────────────────────────────────────────────────────
 
 app.notFound((c) => {
     return c.json({ error: "Not found", code: "NOT_FOUND" }, 404);

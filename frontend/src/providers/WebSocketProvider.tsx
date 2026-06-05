@@ -1,12 +1,10 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // AlphaFlow Suite — frontend/src/providers/WebSocketProvider.tsx
-// Singleton WebSocket State Manager via React Context
+// Observer Mode: PUBLIC WebSocket (no JWT required)
 //
-// ИНВАРИАНТЫ:
-// - Один WSS-коннект на всё приложение (singleton через Context)
-// - Exponential backoff reconnect (max 5 attempts)
-// - JWT передаётся как query param ?token=<JWT>
-// - Дочерние компоненты получают данные через useWebSocket() без дублирования
+// Phase 3 Pivot: WebSocket connects WITHOUT authentication.
+// Anyone can observe the swarm activity in real-time.
+// BFF broadcasts agent_insights to all connected clients.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import {
@@ -29,27 +27,42 @@ export interface AgentInsight {
   confidence?: number;
   reasoning?: string;
   timestamp: number;
+  insightHash?: string;
+  forwardRequest?: {
+    target: string;
+    data: string;
+    value: string;
+    nonce: string;
+    deadline: string;
+  };
+  workerRace?: {
+    status: "pending" | "won" | "failed";
+    winner?: string;
+    winnerAddress?: string;
+    txHash?: string;
+    participants: string[];
+    gasRefund?: string;
+  };
   [key: string]: unknown;
 }
 
 interface WebSocketState {
-  /** Whether the WSS connection is currently open */
   isConnected: boolean;
-  /** Most recent parsed insight from the TEE agent */
   latestInsight: AgentInsight | null;
-  /** Reconnect attempt counter (0 = connected or initial) */
+  /** All insights received in this session */
+  insights: AgentInsight[];
   reconnectAttempt: number;
 }
 
 interface WebSocketContextValue extends WebSocketState {
-  /** Manually trigger reconnection */
   reconnect: () => void;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const MAX_RECONNECT_ATTEMPTS = 5;
-const BASE_BACKOFF_MS = 1000; // 1s, 2s, 4s, 8s, 16s
+const MAX_RECONNECT_ATTEMPTS = 10;
+const BASE_BACKOFF_MS = 1000;
+const MAX_INSIGHTS_BUFFER = 200;
 
 // ─── Context ──────────────────────────────────────────────────────────────────
 
@@ -59,14 +72,13 @@ const WebSocketContext = createContext<WebSocketContextValue | null>(null);
 
 interface WebSocketProviderProps {
   children: ReactNode;
-  /** JWT token for authentication */
-  token: string | null;
 }
 
-export function WebSocketProvider({ children, token }: WebSocketProviderProps) {
+export function WebSocketProvider({ children }: WebSocketProviderProps) {
   const [state, setState] = useState<WebSocketState>({
     isConnected: false,
     latestInsight: null,
+    insights: [],
     reconnectAttempt: 0,
   });
 
@@ -75,21 +87,20 @@ export function WebSocketProvider({ children, token }: WebSocketProviderProps) {
   const attemptRef = useRef(0);
   const mountedRef = useRef(true);
 
-  // ─── Connection Logic ─────────────────────────────────────────────────────
+  // ─── Connection Logic (NO JWT) ────────────────────────────────────────────
 
   const connect = useCallback(() => {
-    if (!token) return;
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
-    // Close existing connection if any
     if (wsRef.current) {
       wsRef.current.close(1000, "reconnecting");
       wsRef.current = null;
     }
 
     const baseUrl =
-      import.meta.env.VITE_BFF_WSS_URL ?? "wss://bff.alphaflow.suite/ws";
-    const url = `${baseUrl}?token=${encodeURIComponent(token)}`;
+      import.meta.env.VITE_BFF_WSS_URL ?? "ws://localhost:3001/ws";
+    // Observer mode: no token needed
+    const url = baseUrl;
 
     const ws = new WebSocket(url);
     wsRef.current = ws;
@@ -107,10 +118,33 @@ export function WebSocketProvider({ children, token }: WebSocketProviderProps) {
     ws.onmessage = (event: MessageEvent) => {
       if (!mountedRef.current) return;
       try {
-        const insight = JSON.parse(event.data as string) as AgentInsight;
+        const raw = JSON.parse(event.data as string);
+
+        // Handle different message shapes from BFF
+        let insight: AgentInsight;
+
+        if (raw.type === "insight" && raw.data) {
+          // Wrapped format from wssBroadcaster
+          insight = {
+            id: raw.streamId ?? `${Date.now()}`,
+            timestamp: (raw.timestamp ?? Math.floor(Date.now() / 1000)) * 1000,
+            ...raw.data,
+          } as AgentInsight;
+        } else if (raw.type === "connected") {
+          // Welcome message — skip
+          return;
+        } else {
+          // Direct insight format
+          insight = raw as AgentInsight;
+        }
+
+        if (!insight.id) insight.id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        if (!insight.timestamp) insight.timestamp = Date.now();
+
         setState((prev) => ({
           ...prev,
           latestInsight: insight,
+          insights: [...prev.insights.slice(-(MAX_INSIGHTS_BUFFER - 1)), insight],
         }));
       } catch {
         // Ignore malformed messages
@@ -119,27 +153,18 @@ export function WebSocketProvider({ children, token }: WebSocketProviderProps) {
 
     ws.onclose = (event: CloseEvent) => {
       if (!mountedRef.current) return;
-
       setState((prev) => ({ ...prev, isConnected: false }));
-
-      // Don't reconnect on intentional close (code 1000) or unmount
       if (event.code === 1000) return;
-
       scheduleReconnect();
     };
 
     ws.onerror = () => {
-      // onclose will fire after onerror — reconnect logic lives there
       ws.close();
     };
-  }, [token]);
-
-  // ─── Exponential Backoff Reconnect ────────────────────────────────────────
+  }, []);
 
   const scheduleReconnect = useCallback(() => {
-    if (attemptRef.current >= MAX_RECONNECT_ATTEMPTS) {
-      return; // Give up after max attempts
-    }
+    if (attemptRef.current >= MAX_RECONNECT_ATTEMPTS) return;
 
     const delay = BASE_BACKOFF_MS * Math.pow(2, attemptRef.current);
     attemptRef.current += 1;
@@ -150,13 +175,9 @@ export function WebSocketProvider({ children, token }: WebSocketProviderProps) {
     }));
 
     reconnectTimerRef.current = setTimeout(() => {
-      if (mountedRef.current) {
-        connect();
-      }
+      if (mountedRef.current) connect();
     }, delay);
   }, [connect]);
-
-  // ─── Manual Reconnect ─────────────────────────────────────────────────────
 
   const reconnect = useCallback(() => {
     attemptRef.current = 0;
@@ -164,20 +185,15 @@ export function WebSocketProvider({ children, token }: WebSocketProviderProps) {
     connect();
   }, [connect]);
 
-  // ─── Lifecycle ────────────────────────────────────────────────────────────
-
   useEffect(() => {
     mountedRef.current = true;
     connect();
 
     return () => {
       mountedRef.current = false;
-
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
       }
-
       if (wsRef.current) {
         wsRef.current.close(1000, "unmount");
         wsRef.current = null;
@@ -185,12 +201,7 @@ export function WebSocketProvider({ children, token }: WebSocketProviderProps) {
     };
   }, [connect]);
 
-  // ─── Render ───────────────────────────────────────────────────────────────
-
-  const value: WebSocketContextValue = {
-    ...state,
-    reconnect,
-  };
+  const value: WebSocketContextValue = { ...state, reconnect };
 
   return (
     <WebSocketContext.Provider value={value}>
@@ -201,18 +212,10 @@ export function WebSocketProvider({ children, token }: WebSocketProviderProps) {
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
-/**
- * Access the singleton WebSocket state.
- * Multiple components calling this hook share the same TCP connection.
- *
- * @returns { isConnected, latestInsight, reconnectAttempt, reconnect }
- */
 export function useWebSocket(): WebSocketContextValue {
   const ctx = useContext(WebSocketContext);
   if (!ctx) {
-    throw new Error(
-      "useWebSocket() must be called within a <WebSocketProvider>"
-    );
+    throw new Error("useWebSocket() must be called within <WebSocketProvider>");
   }
   return ctx;
 }

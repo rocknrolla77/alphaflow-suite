@@ -1,226 +1,130 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // AlphaFlow Suite — frontend/src/components/ProposalView.tsx
-// Proposal Display + EOA Signing (User-Pays flow)
+// Phase 3: Observer Mode — Read-only view of latest arbitrage opportunity
 //
-// FLOW:
-// 1. Fetch active proposal from BFF
-// 2. Display trade parameters
-// 3. User signs EIP-712 typed data with EOA wallet
-// 4. Submit signed tx → on-chain execution (user pays gas)
+// NO wallet signing. NO execution buttons. Pure observer dashboard.
+// Shows the latest ForwardRequest metadata flowing through the swarm.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-import { useState, useEffect, useCallback } from "react";
-import { useAccount, useSignTypedData } from "wagmi";
-import {
-  fetchProposal,
-  consumeProposal,
-  formatBffError,
-  type ProposalData,
-  BffApiError,
-} from "../utils/bffClient.ts";
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-type FlowStatus =
-  | "loading"
-  | "ready"
-  | "signing"
-  | "executing"
-  | "success"
-  | "error";
+import { useWebSocket } from "../providers/WebSocketProvider.tsx";
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function ProposalView() {
-  const { address } = useAccount();
-  const { signTypedDataAsync } = useSignTypedData();
+  const { latestInsight, insights, isConnected } = useWebSocket();
 
-  const [status, setStatus] = useState<FlowStatus>("loading");
-  const [proposal, setProposal] = useState<ProposalData | null>(null);
-  const [error, setError] = useState<string>("");
-  const [txHash, setTxHash] = useState<string>("");
+  // Filter only ARBITRAGE-type insights
+  const arbInsights = insights.filter((i) => i.type === "ARBITRAGE");
+  const latest = arbInsights[arbInsights.length - 1] ?? latestInsight;
 
-  // ─── Load Proposal ──────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    const proposalId = new URLSearchParams(window.location.search).get("proposalId");
-    if (!proposalId) {
-      setStatus("ready");
-      return;
-    }
-
-    const sig = new URLSearchParams(window.location.search).get("sig") ?? "";
-    fetchProposal(proposalId, sig)
-      .then((data) => {
-        setProposal(data);
-        setStatus("ready");
-      })
-      .catch((err) => {
-        setError(err instanceof BffApiError ? formatBffError(err) : String(err));
-        setStatus("error");
-      });
-  }, []);
-
-  // ─── Execute Proposal ───────────────────────────────────────────────────────
-
-  const handleExecute = useCallback(async () => {
-    if (!proposal || !address) return;
-
-    try {
-      setStatus("signing");
-
-      // EIP-712 typed data signing (standard EOA)
-      const signature = await signTypedDataAsync({
-        domain: {
-          name: "AlphaFlow",
-          version: "1",
-          chainId: 5000,
-          verifyingContract: proposal.signerAddress as `0x${string}`,
-        },
-        types: {
-          Execute: [
-            { name: "proposalId", type: "bytes32" },
-            { name: "asset", type: "address" },
-            { name: "action", type: "uint8" },
-            { name: "amount", type: "uint256" },
-            { name: "nonce", type: "uint256" },
-            { name: "deadline", type: "uint256" },
-          ],
-        },
-        primaryType: "Execute",
-        message: {
-          proposalId: proposal.id as `0x${string}`,
-          asset: proposal.asset as `0x${string}`,
-          action: proposal.action === "BUY" ? 0 : 1,
-          amount: BigInt(proposal.recommendedAmount),
-          nonce: BigInt(proposal.nonce),
-          deadline: BigInt(proposal.deadline),
-        },
-      });
-
-      setStatus("executing");
-
-      // Submit to BFF for on-chain execution
-      const result = await consumeProposal(proposal.id, signature, address);
-      setTxHash(result.txHash ?? "");
-      setStatus("success");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setStatus("error");
-    }
-  }, [proposal, address, signTypedDataAsync]);
-
-  // ─── Render ─────────────────────────────────────────────────────────────────
-
-  if (status === "loading") {
+  if (!latest || latest.type === "HEARTBEAT") {
     return (
-      <div className="text-center space-y-2">
-        <div className="w-8 h-8 border-2 border-alpha-border border-t-alpha-accent rounded-full animate-spin mx-auto" />
-        <p className="text-alpha-muted text-sm">Loading proposal...</p>
-      </div>
-    );
-  }
-
-  if (status === "error") {
-    return (
-      <div className="text-center space-y-3 max-w-md">
-        <p className="text-alpha-danger font-bold">Error</p>
-        <p className="text-alpha-muted text-sm">{error}</p>
-        <button
-          onClick={() => window.location.reload()}
-          className="px-4 py-2 bg-alpha-surface border border-alpha-border rounded text-sm hover:border-alpha-accent transition-colors"
-        >
-          Retry
-        </button>
-      </div>
-    );
-  }
-
-  if (status === "success") {
-    return (
-      <div className="text-center space-y-3 max-w-md">
-        <p className="text-3xl">✅</p>
-        <p className="text-alpha-accent font-bold">Execution Confirmed</p>
-        {txHash && (
-          <a
-            href={`https://mantlescan.xyz/tx/${txHash}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-xs text-alpha-muted underline hover:text-alpha-accent"
-          >
-            View on MantleScan →
-          </a>
-        )}
-      </div>
-    );
-  }
-
-  if (!proposal) {
-    return (
-      <div className="text-center space-y-3 max-w-md">
-        <p className="text-alpha-muted text-sm">
-          No active proposal. Waiting for TEE agent insights...
+      <div className="text-center space-y-3 py-6">
+        <div className="text-3xl animate-pulse">🔭</div>
+        <p className="text-xs text-[#6b7280] uppercase tracking-wider">
+          Observer Mode
+        </p>
+        <p className="text-[10px] text-[#4b5563]">
+          {isConnected
+            ? "Connected — Waiting for TEE agent arbitrage signals..."
+            : "Connecting to BFF WebSocket..."}
         </p>
       </div>
     );
   }
 
-  // ─── Proposal Card ──────────────────────────────────────────────────────────
-
   return (
-    <div className="w-full max-w-md bg-alpha-surface border border-alpha-border rounded-lg p-6 space-y-4">
+    <div className="w-full space-y-3">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <span className="text-xs text-alpha-muted uppercase tracking-wider">
-          Proposal
+        <span className="text-xs text-[#6b7280] uppercase tracking-wider">
+          Latest Opportunity
         </span>
         <span
           className={`px-2 py-0.5 rounded text-xs font-bold ${
-            proposal.action === "BUY"
-              ? "bg-green-900/30 text-green-400"
-              : "bg-red-900/30 text-red-400"
+            latest.action === "BUY"
+              ? "bg-terminalGreen/20 text-terminalGreen"
+              : "bg-neonMagenta/20 text-neonMagenta"
           }`}
         >
-          {proposal.action}
+          {latest.action ?? "SIGNAL"}
         </span>
       </div>
 
-      {/* Details */}
-      <div className="space-y-2 text-sm">
-        <div className="flex justify-between">
-          <span className="text-alpha-muted">Asset</span>
-          <span className="font-mono">{proposal.assetSymbol}</span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-alpha-muted">Amount</span>
-          <span className="font-mono">{proposal.recommendedAmount}</span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-alpha-muted">Deadline</span>
-          <span className="font-mono text-xs">
-            {new Date(proposal.deadline * 1000).toLocaleTimeString()}
+      {/* Opportunity Card */}
+      <div className="border border-neonCyan/20 rounded p-3 bg-bgDark/30 space-y-2">
+        {/* Asset */}
+        {latest.asset && (
+          <div className="flex justify-between text-xs">
+            <span className="text-[#9ca3af]">Pair</span>
+            <span className="font-mono text-neonCyan font-bold">{latest.asset}</span>
+          </div>
+        )}
+
+        {/* Confidence */}
+        {latest.confidence != null && (
+          <div className="flex justify-between text-xs">
+            <span className="text-[#9ca3af]">Confidence</span>
+            <ConfidenceBar value={latest.confidence} />
+          </div>
+        )}
+
+        {/* Reasoning */}
+        {latest.reasoning && (
+          <div className="text-[10px] text-[#6b7280] border-t border-neonCyan/10 pt-2 mt-2">
+            <span className="text-[#4b5563]">REASONING: </span>
+            {latest.reasoning.slice(0, 200)}
+          </div>
+        )}
+
+        {/* Timestamp */}
+        <div className="flex justify-between text-[10px] text-[#4b5563]">
+          <span>Detected</span>
+          <span className="font-mono">
+            {new Date(latest.timestamp).toLocaleTimeString()}
           </span>
         </div>
       </div>
 
-      {/* Execute Button */}
-      <button
-        onClick={handleExecute}
-        disabled={status === "signing" || status === "executing"}
-        className="w-full py-3 bg-alpha-accent text-alpha-bg font-bold rounded
-                   hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed
-                   transition-all text-sm"
-      >
-        {status === "signing"
-          ? "Sign with Wallet..."
-          : status === "executing"
-          ? "Executing..."
-          : "Execute Trade"}
-      </button>
+      {/* Autonomous Badge */}
+      <div className="flex items-center gap-2 text-[10px] text-[#6b7280]">
+        <span className="relative flex h-2 w-2">
+          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-neonCyan opacity-75" />
+          <span className="relative inline-flex rounded-full h-2 w-2 bg-neonCyan" />
+        </span>
+        <span>
+          Fully autonomous — Byreal swarm executes without human intervention
+        </span>
+      </div>
 
-      <p className="text-xs text-alpha-muted text-center">
-        You pay gas · Mantle Network · EOA signing
-      </p>
+      {/* Stats bar */}
+      <div className="flex gap-4 text-[10px] text-[#4b5563] border-t border-neonCyan/10 pt-2">
+        <span>Signals: <span className="text-[#E0E0E0] font-mono">{arbInsights.length}</span></span>
+        <span>Total: <span className="text-[#E0E0E0] font-mono">{insights.length}</span></span>
+      </div>
+    </div>
+  );
+}
+
+// ─── Confidence Bar Sub-component ────────────────────────────────────────────
+
+function ConfidenceBar({ value }: { value: number }) {
+  const pct = Math.round(value * 100);
+  const color =
+    pct >= 90
+      ? "bg-terminalGreen"
+      : pct >= 75
+      ? "bg-neonCyan"
+      : "bg-yellow-500";
+
+  return (
+    <div className="flex items-center gap-2">
+      <div className="w-20 h-1.5 bg-[#1a1a2e] rounded overflow-hidden">
+        <div className={`h-full ${color} rounded`} style={{ width: `${pct}%` }} />
+      </div>
+      <span className={`font-mono font-bold ${pct >= 90 ? "text-terminalGreen" : "text-[#E0E0E0]"}`}>
+        {pct}%
+      </span>
     </div>
   );
 }

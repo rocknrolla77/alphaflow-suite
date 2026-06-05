@@ -1,6 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // AlphaFlow Suite — frontend/src/main.tsx
 // Entry Point — React + wagmi + RainbowKit + TanStack Query
+//
+// Phase 3: wagmi/RainbowKit kept for OPTIONAL on-chain verification.
+// Dashboard renders without wallet connection (Observer Mode).
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { StrictMode } from "react";
@@ -20,7 +23,7 @@ import "./index.css";
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      staleTime: 5_000,
+      staleTime: 10_000,
       retry: 2,
     },
   },
@@ -37,6 +40,7 @@ createRoot(document.getElementById("root")!).render(
             accentColor: "#00f3ff",
             accentColorForeground: "#0D0D0D",
             borderRadius: "medium",
+            overlayBlur: "small",
           })}
         >
           <App />

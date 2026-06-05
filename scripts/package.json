@@ -1,0 +1,13 @@
+{
+  "name": "@alphaflow/scripts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "mock-signal": "node mock-nansen-signal.mjs",
+    "mock-signal:burst": "node mock-nansen-signal.mjs 10 1000"
+  },
+  "dependencies": {
+    "redis": "^4.6.12"
+  }
+}
